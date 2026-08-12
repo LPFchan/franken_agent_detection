@@ -1,6 +1,6 @@
 //! Shared connector infrastructure.
 //!
-//! Utilities, data structures, and scan primitives used by all 15 connectors.
+//! Utilities, data structures, and scan primitives shared by the connectors.
 
 pub mod aider;
 pub mod amp;
@@ -25,6 +25,7 @@ pub mod grok;
 #[cfg(feature = "hermes")]
 pub mod hermes;
 pub mod kimi;
+pub mod miniharness;
 pub mod muse;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
@@ -54,7 +55,8 @@ pub use path_trie::PathTrie;
 pub use scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
 pub use token_extraction::{
     ExtractedTokenUsage, ModelInfo, TokenDataSource, estimate_tokens_from_content,
-    extract_claude_code_tokens, extract_codex_tokens, extract_tokens_for_agent, normalize_model,
+    extract_claude_code_tokens, extract_codex_tokens, extract_miniharness_tokens,
+    extract_tokens_for_agent, normalize_model,
 };
 pub use utils::{
     extract_invocations_from_content_blocks, file_modified_since, flatten_content, parse_timestamp,
@@ -242,6 +244,9 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         ("qwen", || Box::new(qwen::QwenConnector::new())),
         ("grok", || Box::new(grok::GrokConnector::new())),
         ("muse", || Box::new(muse::MuseConnector::new())),
+        ("miniharness", || {
+            Box::new(miniharness::MiniharnessConnector::new())
+        }),
     ];
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));

@@ -21,6 +21,8 @@ that upstream has not accepted yet.
 - Discover source files and normalize conversations into the crate's shared
   message and invocation contracts.
 - Support Muse Code's Linux XDG session logs, including nested subagents.
+- Support Miniharness JSONL summon sessions from the canonical default root or
+  explicit consumer-provided roots.
 
 ## Invariants
 

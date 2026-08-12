@@ -289,6 +289,60 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
+/// Extract token usage from one Miniharness message's raw data.
+///
+/// Miniharness uses the compact field names `input`, `output`, `cacheRead`,
+/// `cacheWrite`, and `reasoning`. The complete source record remains in the
+/// normalized message's `extra`; this helper only exposes the existing
+/// per-message token shape and never aggregates a session.
+#[must_use]
+pub fn extract_miniharness_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let message = extra.pointer("/message").unwrap_or(extra);
+    let usage = message.get("usage");
+    let model_name = message
+        .get("model")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let provider = message
+        .get("provider")
+        .and_then(Value::as_str)
+        .map(String::from);
+    let Some(usage) = usage else {
+        return ExtractedTokenUsage {
+            model_name,
+            provider,
+            ..Default::default()
+        };
+    };
+
+    let input_tokens = usage.get("input").and_then(Value::as_i64);
+    let output_tokens = usage.get("output").and_then(Value::as_i64);
+    let cache_read_tokens = usage.get("cacheRead").and_then(Value::as_i64);
+    let cache_creation_tokens = usage.get("cacheWrite").and_then(Value::as_i64);
+    let thinking_tokens = usage.get("reasoning").and_then(Value::as_i64);
+    let has_api_data = input_tokens.is_some()
+        || output_tokens.is_some()
+        || cache_read_tokens.is_some()
+        || cache_creation_tokens.is_some()
+        || thinking_tokens.is_some();
+
+    ExtractedTokenUsage {
+        model_name,
+        provider,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        thinking_tokens,
+        data_source: if has_api_data {
+            TokenDataSource::Api
+        } else {
+            TokenDataSource::Estimated
+        },
+        ..Default::default()
+    }
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -320,6 +374,7 @@ pub fn extract_tokens_for_agent(
     let extracted = match agent_slug {
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
+        "miniharness" => extract_miniharness_tokens(extra),
         "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")
@@ -342,7 +397,9 @@ pub fn extract_tokens_for_agent(
         _ => ExtractedTokenUsage::default(),
     };
 
-    if !extracted.has_token_data() && !content.is_empty() {
+    // Reasoning is a meaningful native sub-count even when a provider omits
+    // input/output. Do not replace that evidence with a content estimate.
+    if !extracted.has_token_data() && extracted.thinking_tokens.is_none() && !content.is_empty() {
         let mut estimated = estimate_tokens_from_content(content, role);
         estimated.model_name = extracted.model_name;
         estimated.provider = extracted.provider;
@@ -554,6 +611,39 @@ mod tests {
         let usage = extract_codex_tokens(&raw);
         assert_eq!(usage.input_tokens, None);
         assert_eq!(usage.output_tokens, Some(77));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_miniharness_tokens_from_nested_message() {
+        let raw: Value = serde_json::json!({
+            "kind": "entry",
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "provider": "commandcode",
+                "model": "deepseek/deepseek-v4-flash",
+                "usage": {
+                    "input": 100,
+                    "output": 20,
+                    "cacheRead": 30,
+                    "cacheWrite": 4,
+                    "reasoning": 5
+                }
+            }
+        });
+
+        let usage = extract_tokens_for_agent("miniharness", &raw, "done", "assistant");
+        assert_eq!(
+            usage.model_name.as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        assert_eq!(usage.provider.as_deref(), Some("commandcode"));
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.cache_creation_tokens, Some(4));
+        assert_eq!(usage.thinking_tokens, Some(5));
         assert_eq!(usage.data_source, TokenDataSource::Api);
     }
 

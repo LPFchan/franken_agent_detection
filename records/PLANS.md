@@ -36,7 +36,7 @@
 
 ### Near Term
 
-- Initiative: Commit and publish the completed fork implementation, then pin it in downstream heatmap and complete the private Muse parser cutover.
+- Initiative: Publish the Miniharness connector, then pin it in downstream heatmap and retire the private transcript parser.
   - Why now: The connector is implemented and verified, and downstream can consume it once the fork is available remotely.
   - Dependencies: Parent commit/push and a downstream dependency update.
   - Related ids: none.

@@ -54,11 +54,13 @@ pub use connectors::{
     claude_code::ClaudeCodeConnector, clawdbot::ClawdbotConnector, cline::ClineConnector,
     codex::CodexConnector, copilot::CopilotConnector, copilot_cli::CopilotCliConnector,
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
-    extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
-    file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, muse::MuseConnector,
-    normalize_model, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
-    pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
+    extract_invocations_from_content_blocks, extract_miniharness_tokens, extract_tokens_for_agent,
+    factory::FactoryConnector, file_modified_since, flatten_content,
+    franken_detection_for_connector, gemini::GeminiConnector, get_connector_factories,
+    grok::GrokConnector, kimi::KimiConnector, miniharness::MiniharnessConnector,
+    muse::MuseConnector, normalize_model, openclaw::OpenClawConnector,
+    openhands::OpenHandsConnector, parse_timestamp, pi_agent::PiAgentConnector,
+    qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
 use serde::{Deserialize, Serialize};
@@ -138,6 +140,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "hermes",
     "kimi",
     "muse",
+    "miniharness",
     "opencode",
     "openclaw",
     "openhands",
@@ -169,6 +172,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
         "muse" | "muse-code" | "muse-code-cli" => Some("muse"),
+        "miniharness" | "mini-harness" => Some("miniharness"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
@@ -311,6 +315,13 @@ fn env_override_roots(slug: &str) -> Option<Vec<PathBuf>> {
                 return None;
             }
             Some(vec![PathBuf::from(root).join("sessions")])
+        }
+        "miniharness" => {
+            let root = read("MINIHARNESS_SESSION_DIR")?;
+            if root.is_empty() {
+                return None;
+            }
+            Some(vec![PathBuf::from(root)])
         }
         "goose" => {
             let root = read("GOOSE_PATH_ROOT")?;
@@ -663,6 +674,9 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             // Do not infer unverified macOS or Windows locations here.
             maybe_push(&mut out, &[".local", "share", "muse", "sessions"]);
             maybe_push(&mut out, &[".config", "muse", "auth.json"]);
+        }
+        "miniharness" => {
+            maybe_push(&mut out, &[".local", "share", "miniharness", "sessions"]);
         }
         "opencode" => {
             // The canonical v1.2+ SQLite database. Probed first so diagnostic
@@ -1142,6 +1156,7 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".local", "share", "muse", "sessions"]),
                     tilde(&[".config", "muse", "auth.json"]),
                 ],
+                "miniharness" => vec![tilde(&[".local", "share", "miniharness", "sessions"])],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the

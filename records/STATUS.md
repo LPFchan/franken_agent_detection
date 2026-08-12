@@ -4,8 +4,8 @@
 
 - Last updated: 2026-08-13
 - Overall posture: `active`
-- Current focus: parent commit/publish and downstream heatmap cutover
-- Highest-priority blocker: none in the implementation; parent commit/push remains pending
+- Current focus: Miniharness connector publication and downstream heatmap cutover
+- Highest-priority blocker: none
 - Next operator decision needed: upstream sync timing after the fork lands
 - Related decisions: none recorded yet
 
@@ -14,10 +14,10 @@
 The fork is based on upstream commit `7857b2d740dcdcfb4f834f9e394a873fe1796a4d` and
 retains both `origin` (the LPFchan fork) and `upstream` remotes. The repo-template
 scaffold, including the optional upstream-intake module and local hooks, is
-installed. Native Muse support is implemented behind the existing `connectors`
-feature, with synthetic fixtures derived from issue #15 and downstream parser
-evidence. Focused and full connector tests pass; the implementation is awaiting
-the parent agent's commit and push.
+installed. Native Muse and Miniharness support are implemented behind the
+existing `connectors` feature. Miniharness normalizes summon JSONL while
+leaving accounting and visibility policy to consumers. Focused and full
+connector tests pass.
 
 ## Active Phases Or Tracks
 
@@ -43,6 +43,17 @@ the parent agent's commit and push.
 - Risks: The observed schema is a small Linux-only corpus and may evolve.
 - Related ids: upstream issue #15.
 
+### Miniharness connector
+
+- Goal: Detect, discover, and normalize Miniharness summon JSONL without carrying downstream accounting policy.
+- Status: `done`
+- Why this matters now: Downstream heatmap can replace its private transcript parser with the shared connector.
+- Current work: Publication and downstream dependency cutover.
+- Exit criteria: Discovery parity, envelope variants, malformed input, filename fallback, multiple usage messages, and token evidence are covered by tests.
+- Dependencies: Miniharness's stable JSONL session contract and default root.
+- Risks: Consumers must choose their own session-level aggregation and visibility policy.
+- Related ids: none.
+
 ## Recent Changes To Project Reality
 
 - Date: 2026-08-13
@@ -53,6 +64,10 @@ the parent agent's commit and push.
   - Change: Completed native Muse detection, scanning, normalization, exports, and synthetic tests.
   - Why it matters: Downstream consumers have a public connector capability to pin.
   - Related ids: upstream issue #15.
+- Date: 2026-08-13
+  - Change: Completed native Miniharness detection, scanning, normalization, per-message usage extraction, exports, and synthetic tests.
+  - Why it matters: Consumers can parse summon sessions without importing Heatmap accounting policy.
+  - Related ids: none.
 
 ## Active Blockers And Risks
 
@@ -64,11 +79,11 @@ the parent agent's commit and push.
 
 ## Immediate Next Steps
 
-- Next: Commit and publish the reviewed fork changes.
+- Next: Commit and publish the reviewed Miniharness connector.
   - Owner: Parent/orchestrator.
   - Trigger: Parent review completion.
   - Related ids: none.
-- Next: Pin the published fork in downstream heatmap and cut over its private Muse parser.
+- Next: Pin the published fork in downstream heatmap and retire its private Miniharness transcript parser.
   - Owner: Parent/orchestrator.
   - Trigger: Fork commit and push available.
   - Related ids: none.

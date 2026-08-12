@@ -15,17 +15,19 @@
 A small Rust crate for deterministic, local detection of installed coding-agent tools.
 
 With the `connectors` feature, this LPFchan fork also exposes normalized
-conversation connectors, including Muse Code's Linux XDG session logs. Muse
-normalizes root and nested-subagent `session.jsonl` files, sequence ordering,
-microsecond timestamps, assistant tool calls, and tool results. Muse model
-completion telemetry is not projected as message content or message-owned
-metadata, and is not attributed to individual messages because the observed
-schema does not provide a stable correlation id. The observed schema is
-documented in [upstream issue #15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15).
+conversation connectors, including Muse Code's Linux XDG session logs and
+Miniharness JSONL summon sessions. Muse normalizes root and nested-subagent
+`session.jsonl` files, sequence ordering, microsecond timestamps, assistant
+tool calls, and tool results. Miniharness normalizes one summon per JSONL file,
+including explicit roots and the default
+`~/.local/share/miniharness/sessions` root. Miniharness retains provider source
+evidence in normalized message payloads without imposing consumer-side
+accounting or visibility policy. Muse's observed schema is documented in
+[upstream issue #15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15).
 
-The crates.io commands below describe the upstream package. Muse support in
-this LPFchan fork requires the git dependency shown in the installation
-section.
+The crates.io commands below describe the upstream package. Muse and
+Miniharness support in this LPFchan fork requires the git dependency shown in
+the installation section.
 
 ## What this crate does
 
@@ -82,7 +84,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 | Approach | Pros | Cons |
 |---|---|---|
-| `franken-agent-detection` | Shared schema, test overrides, consistent connector handling | Focused scope (detection only) |
+| `franken-agent-detection` | Shared schema, test overrides, consistent connector handling | Focused local detection and normalization scope |
 | Ad-hoc per-project checks | Fast to start | Drift, inconsistent outputs, repeated bugs |
 | Full search/index systems | Rich capabilities | Unnecessary weight for install detection |
 
@@ -130,6 +132,11 @@ Muse detection recognizes `~/.local/share/muse/sessions` and
 `~/.config/muse/auth.json`. These Linux paths are the only Muse platform paths
 verified by the current schema evidence.
 
+Miniharness detection recognizes `~/.local/share/miniharness/sessions`; the
+`MINIHARNESS_SESSION_DIR` environment variable overrides that root. Consumers
+can also pass an explicit `ScanRoot` for a custom session directory or one
+JSONL session file.
+
 ## API reference
 
 | Item | Purpose |
@@ -176,7 +183,7 @@ detect_installed_agents(opts)
 
 ## Limitations
 
-- Installation detection only; no session parsing or indexing.
+- Local installation detection and normalized session parsing; no background indexing.
 - Default probe roots are opinionated and can require overrides in custom environments.
 - No background watching; checks run only when called.
 
