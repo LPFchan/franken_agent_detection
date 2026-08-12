@@ -14,9 +14,18 @@
 
 A small Rust crate for deterministic, local detection of installed coding-agent tools.
 
-```bash
-cargo add franken-agent-detection
-```
+With the `connectors` feature, this LPFchan fork also exposes normalized
+conversation connectors, including Muse Code's Linux XDG session logs. Muse
+normalizes root and nested-subagent `session.jsonl` files, sequence ordering,
+microsecond timestamps, assistant tool calls, and tool results. Muse model
+completion telemetry is not projected as message content or message-owned
+metadata, and is not attributed to individual messages because the observed
+schema does not provide a stable correlation id. The observed schema is
+documented in [upstream issue #15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15).
+
+The crates.io commands below describe the upstream package. Muse support in
+this LPFchan fork requires the git dependency shown in the installation
+section.
 
 ## What this crate does
 
@@ -81,6 +90,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### crates.io (recommended)
 
+Upstream package installation:
+
 ```bash
 cargo add franken-agent-detection
 ```
@@ -92,10 +103,17 @@ cargo add franken-agent-detection
 franken-agent-detection = "0.1.7"
 ```
 
+### LPFchan fork with Muse support
+
+```toml
+[dependencies]
+franken-agent-detection = { git = "https://github.com/LPFchan/franken_agent_detection", features = ["connectors"] }
+```
+
 ### From source
 
 ```bash
-git clone https://github.com/Dicklesworthstone/franken_agent_detection
+git clone https://github.com/LPFchan/franken_agent_detection
 cd franken_agent_detection
 cargo test
 ```
@@ -107,6 +125,10 @@ cargo test
 3. Read `report.installed_agents` and `report.summary`.
 4. Use `only_connectors` when you want to scope checks.
 5. Use `root_overrides` for deterministic tests.
+
+Muse detection recognizes `~/.local/share/muse/sessions` and
+`~/.config/muse/auth.json`. These Linux paths are the only Muse platform paths
+verified by the current schema evidence.
 
 ## API reference
 

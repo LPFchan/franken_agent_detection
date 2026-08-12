@@ -56,8 +56,8 @@ pub use connectors::{
     estimate_tokens_from_content, extract_claude_code_tokens, extract_codex_tokens,
     extract_invocations_from_content_blocks, extract_tokens_for_agent, factory::FactoryConnector,
     file_modified_since, flatten_content, franken_detection_for_connector, gemini::GeminiConnector,
-    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, normalize_model,
-    openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
+    get_connector_factories, grok::GrokConnector, kimi::KimiConnector, muse::MuseConnector,
+    normalize_model, openclaw::OpenClawConnector, openhands::OpenHandsConnector, parse_timestamp,
     pi_agent::PiAgentConnector, qwen::QwenConnector, token_extraction, vibe::VibeConnector,
 };
 
@@ -137,6 +137,7 @@ const KNOWN_CONNECTORS: &[&str] = &[
     "grok",
     "hermes",
     "kimi",
+    "muse",
     "opencode",
     "openclaw",
     "openhands",
@@ -167,6 +168,7 @@ fn canonical_connector_slug(slug: &str) -> Option<&'static str> {
         "grok" | "grok-cli" | "grok-build" | "xai-grok" => Some("grok"),
         "hermes" | "hermes-agent" => Some("hermes"),
         "kimi" | "kimi-code" | "kimi-ai" => Some("kimi"),
+        "muse" | "muse-code" | "muse-code-cli" => Some("muse"),
         "opencode" | "open-code" => Some("opencode"),
         "openclaw" | "open-claw" => Some("openclaw"),
         "openhands" | "open-hands" => Some("openhands"),
@@ -656,6 +658,12 @@ fn default_probe_roots(slug: &str) -> Vec<PathBuf> {
             maybe_push(&mut out, &[".kimi", "sessions"]);
             maybe_push(&mut out, &[".kimi"]);
         }
+        "muse" => {
+            // Muse Code 0.1.0 storage verified by upstream issue #15 on Linux.
+            // Do not infer unverified macOS or Windows locations here.
+            maybe_push(&mut out, &[".local", "share", "muse", "sessions"]);
+            maybe_push(&mut out, &[".config", "muse", "auth.json"]);
+        }
         "opencode" => {
             // The canonical v1.2+ SQLite database. Probed first so diagnostic
             // output surfaces the data file (not the sibling config directory)
@@ -1130,6 +1138,10 @@ pub fn default_probe_paths_tilde() -> Vec<(&'static str, Vec<String>)> {
                     tilde(&[".kimi", "sessions"]),
                     tilde(&[".kimi"]),
                 ],
+                "muse" => vec![
+                    tilde(&[".local", "share", "muse", "sessions"]),
+                    tilde(&[".config", "muse", "auth.json"]),
+                ],
                 "opencode" => vec![
                     // Direct path to the v1.2+ SQLite database — probed first
                     // so display/diagnostics surface the data file (not the
@@ -1478,6 +1490,10 @@ mod tests {
         assert!(factory.contains(&"~/.factory-droid".to_string()));
         assert!(factory.contains(&"~/.config/factory-droid".to_string()));
 
+        let muse = by_slug.get("muse").expect("muse paths");
+        assert!(muse.contains(&"~/.local/share/muse/sessions".to_string()));
+        assert!(muse.contains(&"~/.config/muse/auth.json".to_string()));
+
         let amp = by_slug.get("amp").expect("amp paths");
         assert!(
             amp.contains(
@@ -1558,5 +1574,27 @@ mod tests {
         assert!(cline.contains(
             &"~/AppData/Roaming/Cursor/User/globalStorage/rooveterinaryinc.roo-cline".to_string()
         ));
+    }
+
+    #[test]
+    fn muse_alias_and_root_override_detect_deterministically() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("muse-sessions");
+        std::fs::create_dir_all(&root).expect("create muse root");
+        let report = detect_installed_agents(&AgentDetectOptions {
+            only_connectors: Some(vec!["muse-code".to_string()]),
+            include_undetected: true,
+            root_overrides: vec![AgentDetectRootOverride {
+                slug: "muse-code".to_string(),
+                root: root.clone(),
+            }],
+        })
+        .expect("detect Muse");
+        assert_eq!(report.summary.detected_count, 1);
+        assert_eq!(report.installed_agents[0].slug, "muse");
+        assert_eq!(
+            report.installed_agents[0].root_paths,
+            vec![root.display().to_string()]
+        );
     }
 }

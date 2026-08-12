@@ -25,6 +25,7 @@ pub mod grok;
 #[cfg(feature = "hermes")]
 pub mod hermes;
 pub mod kimi;
+pub mod muse;
 pub mod openclaw;
 #[cfg(feature = "opencode")]
 pub mod opencode;
@@ -240,6 +241,7 @@ pub fn get_connector_factories() -> Vec<(&'static str, fn() -> Box<dyn Connector
         }),
         ("qwen", || Box::new(qwen::QwenConnector::new())),
         ("grok", || Box::new(grok::GrokConnector::new())),
+        ("muse", || Box::new(muse::MuseConnector::new())),
     ];
     #[cfg(feature = "opencode")]
     v.push(("opencode", || Box::new(opencode::OpenCodeConnector::new())));
