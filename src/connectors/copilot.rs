@@ -1,13 +1,15 @@
 //! Connector for GitHub Copilot Chat session logs.
 //!
-//! GitHub Copilot Chat stores conversation history in VS Code's globalStorage:
-//! - Linux: ~/.config/Code/User/globalStorage/github.copilot-chat/
-//! - macOS: ~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/
-//! - Windows: %APPDATA%/Code/User/globalStorage/github.copilot-chat/
+//! VS Code has used three native persistence generations for Copilot-backed
+//! chat sessions:
+//! - `state.vscdb`, key `interactive.sessions` (through March 2025)
+//! - `workspaceStorage/<id>/chatSessions/*.json` (March 2025 through 1.108)
+//! - the same session directory with append-only `.jsonl` logs (1.109 onward)
 //!
-//! The conversations directory contains JSON files with chat sessions.
-//! Each file typically represents a conversation panel session with an array
-//! of conversation threads.
+//! Empty-window sessions live under User-level global storage. The connector
+//! scans Code, Code - Insiders, and `VSCodium` roots on Linux, macOS, and Windows,
+//! and filters the shared native store to Copilot-owned sessions. Converted
+//! exports under `globalStorage/github.copilot-chat` remain supported too.
 //!
 //! Additionally, the `gh copilot` CLI may store history at:
 //! - ~/.config/gh-copilot/
@@ -45,22 +47,48 @@
 //! ]
 //! ```
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+#[cfg(feature = "copilot-sqlite")]
+use frankensqlite::compat::{OpenFlags, RowExt};
+#[cfg(feature = "copilot-sqlite")]
+use frankensqlite::params;
 use serde_json::Value;
 use walkdir::WalkDir;
 
 use super::scan::{DiscoveredSourceFile, DiscoveredSourceRole, ScanContext, ScanRoot};
+#[cfg(feature = "copilot-sqlite")]
+use super::sqlite_sync::{ConnectionExt, open_with_flags};
+use super::vscode_chat::replay_operation_log;
 use super::{
-    Connector, file_modified_since, flatten_content, franken_detection_for_connector,
-    parse_timestamp,
+    Connector, extract_invocations_from_content_blocks, file_modified_since, flatten_content,
+    franken_detection_for_connector, parse_timestamp,
 };
-use crate::types::{DetectionResult, NormalizedConversation, NormalizedMessage};
+use crate::types::{
+    DetectionResult, NormalizedConversation, NormalizedInvocation, NormalizedMessage,
+};
 
 pub struct CopilotConnector;
+
+fn min_timestamp(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.min(candidate)),
+        (None, candidate) => candidate,
+        (current, None) => current,
+    }
+}
+
+fn max_timestamp(current: Option<i64>, candidate: Option<i64>) -> Option<i64> {
+    match (current, candidate) {
+        (Some(current), Some(candidate)) => Some(current.max(candidate)),
+        (None, candidate) => candidate,
+        (current, None) => current,
+    }
+}
 
 impl Default for CopilotConnector {
     fn default() -> Self {
@@ -74,28 +102,70 @@ impl CopilotConnector {
         Self
     }
 
-    /// Known VS Code globalStorage paths for Copilot Chat on Linux.
-    fn vscode_linux_paths() -> Vec<PathBuf> {
+    /// VS Code User roots containing workspaceStorage and globalStorage.
+    ///
+    /// Keep the roots explicit for all supported product variants.  A User
+    /// root is scanned once, which covers both workspace chat files and the
+    /// application-scoped global database without duplicate physical files.
+    fn vscode_linux_user_paths() -> Vec<PathBuf> {
         let Some(home) = dirs::home_dir() else {
             return Vec::new();
         };
         vec![
-            home.join(".config/Code/User/globalStorage/github.copilot-chat"),
-            home.join(".config/Code - Insiders/User/globalStorage/github.copilot-chat"),
-            home.join(".config/VSCodium/User/globalStorage/github.copilot-chat"),
+            home.join(".config/Code/User"),
+            home.join(".config/Code - Insiders/User"),
+            home.join(".config/VSCodium/User"),
         ]
+    }
+
+    /// Known VS Code User roots on macOS.
+    fn vscode_macos_user_paths() -> Vec<PathBuf> {
+        let Some(home) = dirs::home_dir() else {
+            return Vec::new();
+        };
+        vec![
+            home.join("Library/Application Support/Code/User"),
+            home.join("Library/Application Support/Code - Insiders/User"),
+            home.join("Library/Application Support/VSCodium/User"),
+        ]
+    }
+
+    /// Known VS Code User roots on Windows.
+    fn vscode_windows_user_paths() -> Vec<PathBuf> {
+        let Some(appdata) = dirs::config_dir() else {
+            return Vec::new();
+        };
+        vec![
+            appdata.join("Code/User"),
+            appdata.join("Code - Insiders/User"),
+            appdata.join("VSCodium/User"),
+        ]
+    }
+
+    fn vscode_user_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        paths.extend(Self::vscode_linux_user_paths());
+        paths.extend(Self::vscode_macos_user_paths());
+        paths.extend(Self::vscode_windows_user_paths());
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    /// Known VS Code globalStorage paths for Copilot Chat on Linux.
+    fn vscode_linux_paths() -> Vec<PathBuf> {
+        Self::vscode_linux_user_paths()
+            .into_iter()
+            .map(|path| path.join("globalStorage/github.copilot-chat"))
+            .collect()
     }
 
     /// Known VS Code globalStorage paths for Copilot Chat on macOS.
     fn vscode_macos_paths() -> Vec<PathBuf> {
-        let Some(home) = dirs::home_dir() else {
-            return Vec::new();
-        };
-        vec![
-            home.join("Library/Application Support/Code/User/globalStorage/github.copilot-chat"),
-            home.join("Library/Application Support/Code - Insiders/User/globalStorage/github.copilot-chat"),
-            home.join("Library/Application Support/VSCodium/User/globalStorage/github.copilot-chat"),
-        ]
+        Self::vscode_macos_user_paths()
+            .into_iter()
+            .map(|path| path.join("globalStorage/github.copilot-chat"))
+            .collect()
     }
 
     /// gh copilot CLI config path and Copilot CLI session-state paths.
@@ -117,20 +187,16 @@ impl CopilotConnector {
     ///
     /// Uses `%APPDATA%` (typically `C:\Users\<name>\AppData\Roaming`).
     fn vscode_windows_paths() -> Vec<PathBuf> {
-        let Some(appdata) = dirs::config_dir() else {
-            return Vec::new();
-        };
-
-        vec![
-            appdata.join("Code/User/globalStorage/github.copilot-chat"),
-            appdata.join("Code - Insiders/User/globalStorage/github.copilot-chat"),
-            appdata.join("VSCodium/User/globalStorage/github.copilot-chat"),
-        ]
+        Self::vscode_windows_user_paths()
+            .into_iter()
+            .map(|path| path.join("globalStorage/github.copilot-chat"))
+            .collect()
     }
 
     /// All candidate paths for this platform.
     fn all_candidate_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
+        paths.extend(Self::vscode_user_paths());
         paths.extend(Self::vscode_linux_paths());
         paths.extend(Self::vscode_macos_paths());
         paths.extend(Self::vscode_windows_paths());
@@ -168,6 +234,22 @@ impl CopilotConnector {
             .any(|pair| pair[0] == "gh" && pair[1] == "copilot")
     }
 
+    /// Return true for a native VS Code storage root or one of its children.
+    fn looks_like_vscode_storage(path: &Path) -> bool {
+        let segments: Vec<String> = path
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy().to_lowercase())
+            .collect();
+        segments.iter().any(|segment| {
+            matches!(
+                segment.as_str(),
+                "workspacestorage" | "chatsessions" | "emptywindowchatsessions" | "state.vscdb"
+            )
+        }) || (path.file_name().is_some_and(|name| name == "User")
+            && (path.join("workspaceStorage").exists() || path.join("globalStorage").exists()))
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn append_explicit_roots(roots: &mut Vec<PathBuf>, base: &Path) {
         let file_name = base.file_name().and_then(|n| n.to_str());
         let is_config = file_name.is_some_and(|n| n == ".config");
@@ -180,9 +262,36 @@ impl CopilotConnector {
             file_name.is_some_and(|n| n == "Code" || n == "Code - Insiders" || n == "VSCodium");
         let is_user = file_name.is_some_and(|n| n == "User");
         let is_global_storage = file_name.is_some_and(|n| n == "globalStorage");
+        let is_workspace_storage = file_name.is_some_and(|n| n == "workspaceStorage");
+        let is_chat_sessions = file_name.is_some_and(|n| n == "chatSessions");
+        let is_workspace_id = base
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "workspaceStorage");
+        let is_state_db = base.is_file() && file_name.is_some_and(|n| n == "state.vscdb");
 
-        if base.exists() && Self::looks_like_copilot_storage(base) {
+        if base.exists()
+            && (Self::looks_like_copilot_storage(base)
+                || Self::looks_like_vscode_storage(base)
+                || is_workspace_id)
+        {
             roots.push(base.to_path_buf());
+        }
+        if is_user {
+            roots.push(base.to_path_buf());
+        }
+
+        // Explicit roots may point directly at any native storage layer.
+        // Keeping the physical root lets discovery and scanning share exactly
+        // the same traversal and preserves remote-root provenance.
+        if is_state_db || is_workspace_storage || is_chat_sessions || is_global_storage {
+            roots.push(base.to_path_buf());
+        }
+        if is_workspace_id {
+            let sessions = base.join("chatSessions");
+            if sessions.exists() {
+                roots.push(sessions);
+            }
         }
 
         if file_name.is_some_and(|n| n == ".copilot") {
@@ -201,6 +310,10 @@ impl CopilotConnector {
             if copilot_chat.exists() {
                 roots.push(copilot_chat);
             }
+            let empty_window = base.join("emptyWindowChatSessions");
+            if empty_window.exists() {
+                roots.push(empty_window);
+            }
         }
 
         if file_name.is_some_and(|n| n == "gh") {
@@ -213,6 +326,9 @@ impl CopilotConnector {
         let mut candidates: Vec<PathBuf> = Vec::new();
 
         if is_config {
+            candidates.push(base.join("Code/User"));
+            candidates.push(base.join("Code - Insiders/User"));
+            candidates.push(base.join("VSCodium/User"));
             candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
@@ -221,21 +337,30 @@ impl CopilotConnector {
         }
 
         if is_app_support {
+            candidates.push(base.join("Code/User"));
+            candidates.push(base.join("Code - Insiders/User"));
+            candidates.push(base.join("VSCodium/User"));
             candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
         }
         if is_appdata_roaming {
+            candidates.push(base.join("Code/User"));
+            candidates.push(base.join("Code - Insiders/User"));
+            candidates.push(base.join("VSCodium/User"));
             candidates.push(base.join("Code/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("Code - Insiders/User/globalStorage/github.copilot-chat"));
             candidates.push(base.join("VSCodium/User/globalStorage/github.copilot-chat"));
         }
 
         if is_code_variant {
+            candidates.push(base.join("User"));
             candidates.push(base.join("User/globalStorage/github.copilot-chat"));
         }
         if is_user {
             candidates.push(base.join("globalStorage/github.copilot-chat"));
+            candidates.push(base.join("workspaceStorage"));
+            candidates.push(base.join("globalStorage"));
         }
 
         if !(is_config
@@ -245,6 +370,15 @@ impl CopilotConnector {
             || is_user
             || is_global_storage)
         {
+            candidates.push(base.join(".config/Code/User"));
+            candidates.push(base.join(".config/Code - Insiders/User"));
+            candidates.push(base.join(".config/VSCodium/User"));
+            candidates.push(base.join("Library/Application Support/Code/User"));
+            candidates.push(base.join("Library/Application Support/Code - Insiders/User"));
+            candidates.push(base.join("Library/Application Support/VSCodium/User"));
+            candidates.push(base.join("AppData/Roaming/Code/User"));
+            candidates.push(base.join("AppData/Roaming/Code - Insiders/User"));
+            candidates.push(base.join("AppData/Roaming/VSCodium/User"));
             candidates.push(base.join(".config/Code/User/globalStorage/github.copilot-chat"));
             candidates
                 .push(base.join(".config/Code - Insiders/User/globalStorage/github.copilot-chat"));
@@ -271,10 +405,17 @@ impl CopilotConnector {
             candidates.push(base.join(".config/gh/copilot"));
             candidates.push(base.join(".copilot/session-state"));
             candidates.push(base.join(".copilot/history-session-state"));
+            candidates.push(base.join("Code/User"));
+            candidates.push(base.join("Code - Insiders/User"));
+            candidates.push(base.join("VSCodium/User"));
         }
 
         for candidate in candidates {
-            if candidate.exists() {
+            if candidate.exists()
+                && (Self::looks_like_copilot_storage(&candidate)
+                    || Self::looks_like_vscode_storage(&candidate)
+                    || candidate.file_name().is_some_and(|n| n == "User"))
+            {
                 roots.push(candidate);
             }
         }
@@ -293,21 +434,26 @@ impl CopilotConnector {
                 .extension()
                 .and_then(|e| e.to_str())
                 .is_some_and(|e| e == "json" || e == "jsonl")
+                && (Self::native_session_file(root) || Self::looks_like_copilot_storage(root))
             {
                 files.push(root.to_path_buf());
             }
             return files;
         }
 
-        // Walk the directory for JSON/JSONL files (limited depth to avoid deep traversal).
+        // Walk the directory for JSON/JSONL files. A User root reaches
+        // workspaceStorage/{id}/chatSessions/{session}.jsonl at depth four.
         for entry in WalkDir::new(root)
-            .max_depth(4)
+            .max_depth(5)
             .into_iter()
             .flatten()
             .filter(|e| e.file_type().is_file())
         {
             let name = entry.file_name().to_string_lossy();
-            if name.ends_with(".json") || name.ends_with(".jsonl") {
+            let is_json = name.ends_with(".json") || name.ends_with(".jsonl");
+            let is_session = Self::native_session_file(entry.path())
+                || Self::looks_like_copilot_storage(entry.path());
+            if is_json && is_session {
                 files.push(entry.path().to_path_buf());
             }
         }
@@ -317,11 +463,60 @@ impl CopilotConnector {
         files
     }
 
+    /// Find native VS Code state databases beneath a User/storage root.
+    #[cfg(feature = "copilot-sqlite")]
+    fn find_db_files(root: &Path) -> Vec<PathBuf> {
+        let mut dbs = Vec::new();
+        if root.is_file() {
+            if root.file_name().is_some_and(|name| name == "state.vscdb") {
+                dbs.push(root.to_path_buf());
+            }
+            return dbs;
+        }
+        let direct = root.join("state.vscdb");
+        if direct.is_file() {
+            dbs.push(direct);
+        }
+        if root.file_name().is_some_and(|name| name == "User") {
+            let global = root.join("globalStorage/state.vscdb");
+            if global.is_file() {
+                dbs.push(global);
+            }
+            let workspaces = root.join("workspaceStorage");
+            if let Ok(entries) = fs::read_dir(workspaces) {
+                for entry in entries.flatten() {
+                    let db = entry.path().join("state.vscdb");
+                    if db.is_file() {
+                        dbs.push(db);
+                    }
+                }
+            }
+        } else if root
+            .file_name()
+            .is_some_and(|name| name == "workspaceStorage")
+        {
+            if let Ok(entries) = fs::read_dir(root) {
+                for entry in entries.flatten() {
+                    let db = entry.path().join("state.vscdb");
+                    if db.is_file() {
+                        dbs.push(db);
+                    }
+                }
+            }
+        }
+        dbs.sort();
+        dbs.dedup();
+        dbs
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots: Vec<ScanRoot> = Vec::new();
 
         if ctx.use_default_detection() {
-            if Self::looks_like_copilot_storage(&ctx.data_dir) && ctx.data_dir.exists() {
+            if (Self::looks_like_copilot_storage(&ctx.data_dir)
+                || Self::looks_like_vscode_storage(&ctx.data_dir))
+                && ctx.data_dir.exists()
+            {
                 roots.push(ScanRoot::local(ctx.data_dir.clone()));
             } else {
                 roots.extend(
@@ -363,8 +558,409 @@ impl CopilotConnector {
                     .with_fs_metadata(),
                 );
             }
+            #[cfg(feature = "copilot-sqlite")]
+            for db_path in Self::find_db_files(&root.path) {
+                if !file_modified_since(&db_path, ctx.since_ts) {
+                    continue;
+                }
+                out.push(
+                    DiscoveredSourceFile::new(
+                        "copilot",
+                        &root,
+                        db_path,
+                        DiscoveredSourceRole::SqliteDatabase,
+                        true,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
         }
+        out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        out.dedup_by(|a, b| a.source_path == b.source_path);
         out
+    }
+
+    fn native_session_file(path: &Path) -> bool {
+        let is_session_file = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("jsonl")
+            });
+        is_session_file
+            && path.components().any(|component| {
+                matches!(
+                    component.as_os_str().to_str(),
+                    Some("chatSessions" | "emptyWindowChatSessions" | "transferredChatSessions")
+                )
+            })
+    }
+
+    fn workspace_for_session(path: &Path) -> Option<PathBuf> {
+        let workspace_json = path.parent()?.parent()?.join("workspace.json");
+        let value: Value = serde_json::from_str(&fs::read_to_string(workspace_json).ok()?).ok()?;
+        value
+            .get("folder")
+            .or_else(|| value.get("workspaceFolder"))
+            .or_else(|| value.get("workspace"))
+            .and_then(Value::as_str)
+            .and_then(Self::path_from_uri)
+    }
+
+    fn path_from_uri(value: &str) -> Option<PathBuf> {
+        let path = value.strip_prefix("file://")?;
+        let decoded = Self::percent_decode(path)?;
+        // VS Code records Windows file URIs as file:///c%3A/... . Preserve a
+        // Windows drive path when scanning a copied Windows workspace on Unix.
+        if decoded.len() > 2 && decoded.starts_with('/') && decoded.as_bytes().get(2) == Some(&b':')
+        {
+            return Some(PathBuf::from(&decoded[1..]));
+        }
+        Some(PathBuf::from(decoded))
+    }
+
+    fn percent_decode(value: &str) -> Option<String> {
+        let bytes = value.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] == b'%' {
+                let high = Self::hex_value(*bytes.get(index + 1)?)?;
+                let low = Self::hex_value(*bytes.get(index + 2)?)?;
+                out.push(high * 16 + low);
+                index += 3;
+            } else {
+                out.push(bytes[index]);
+                index += 1;
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    const fn hex_value(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            b'A'..=b'F' => Some(value - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    fn copilot_text(value: &Value) -> Option<String> {
+        if let Some(text) = value.as_str() {
+            return Some(text.to_string());
+        }
+        if let Some(text) = value.get("text").and_then(Value::as_str) {
+            return Some(text.to_string());
+        }
+        if let Some(parts) = value.get("parts") {
+            let text = flatten_content(parts);
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+        None
+    }
+
+    fn copilot_agent_value(value: &Value) -> bool {
+        if let Some(value) = value.get("value") {
+            return Self::copilot_agent_value(value);
+        }
+        let Some(text) = value.as_str() else {
+            return false;
+        };
+        let normalized = text.to_ascii_lowercase();
+        normalized == "github.copilot-chat"
+            || normalized == "github copilot"
+            || normalized == "github-copilot"
+            || normalized.contains("github.copilot-chat")
+            || normalized.contains("github copilot")
+    }
+
+    fn has_copilot_evidence(session: &Value) -> bool {
+        if session
+            .get("responderUsername")
+            .is_some_and(Self::copilot_agent_value)
+        {
+            return true;
+        }
+        session
+            .get("requests")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|request| request.get("agent"))
+            .any(|agent| {
+                if Self::copilot_agent_value(agent) {
+                    return true;
+                }
+                ["id", "name", "displayName", "extensionId", "publisher"]
+                    .iter()
+                    .filter_map(|key| agent.get(*key))
+                    .any(Self::copilot_agent_value)
+            })
+    }
+
+    fn response_parts(value: &Value) -> (String, Vec<NormalizedInvocation>) {
+        let parts: Vec<&Value> = value
+            .as_array()
+            .map_or_else(|| vec![value], |parts| parts.iter().collect());
+        let mut text = String::new();
+        let mut invocations = extract_invocations_from_content_blocks(value);
+        for part in &parts {
+            let part_text = if part.get("kind").and_then(Value::as_str) == Some("markdownContent") {
+                part.get("content").and_then(Self::copilot_text)
+            } else {
+                Self::copilot_text(part)
+            };
+            if let Some(part_text) = part_text.filter(|text| !text.trim().is_empty()) {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str(&part_text);
+            }
+
+            if part.get("kind").and_then(Value::as_str) == Some("toolInvocationSerialized") {
+                let name = part
+                    .get("toolId")
+                    .or_else(|| part.get("toolName"))
+                    .or_else(|| part.get("name"))
+                    .and_then(Value::as_str);
+                if let Some(name) = name {
+                    invocations.push(NormalizedInvocation {
+                        kind: "tool".to_string(),
+                        name: name.to_string(),
+                        raw_name: None,
+                        call_id: part
+                            .get("toolCallId")
+                            .or_else(|| part.get("callId"))
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        arguments: part
+                            .get("arguments")
+                            .or_else(|| part.get("parameters"))
+                            .cloned(),
+                    });
+                }
+            }
+        }
+        (text, invocations)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn parse_native_session_value(
+        session: &Value,
+        source_path: &Path,
+        workspace_hint: Option<PathBuf>,
+        storage: &str,
+    ) -> Option<NormalizedConversation> {
+        if !session.is_object() || !Self::has_copilot_evidence(session) {
+            return None;
+        }
+        let requests = session.get("requests").and_then(Value::as_array)?;
+        let external_id = session
+            .get("sessionId")
+            .or_else(|| session.get("id"))
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or_else(|| {
+                source_path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .map(String::from)
+            });
+        let workspace = session
+            .get("workingDirectory")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or(workspace_hint);
+        let mut messages = Vec::new();
+        let mut started_at = session.get("creationDate").and_then(parse_timestamp);
+        let mut ended_at = started_at;
+
+        for request in requests {
+            let Some(request_value) = request.get("message") else {
+                continue;
+            };
+            let user_content = Self::copilot_text(request_value)
+                .unwrap_or_else(|| Self::extract_message_content(request));
+            let user_ts = request.get("timestamp").and_then(parse_timestamp);
+            if !user_content.trim().is_empty() {
+                started_at = min_timestamp(started_at, user_ts);
+                ended_at = max_timestamp(ended_at, user_ts);
+                messages.push(NormalizedMessage {
+                    idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                    role: "user".to_string(),
+                    author: Some("user".to_string()),
+                    created_at: user_ts,
+                    content: user_content,
+                    extra: request.clone(),
+                    invocations: Vec::new(),
+                    snippets: Vec::new(),
+                });
+            }
+
+            if let Some(response) = request.get("response") {
+                let (content, invocations) = Self::response_parts(response);
+                let response_ts = request
+                    .get("responseTimestamp")
+                    .or_else(|| response.get("timestamp"))
+                    .and_then(parse_timestamp);
+                started_at = min_timestamp(started_at, response_ts);
+                ended_at = max_timestamp(ended_at, response_ts);
+                if !content.trim().is_empty() || !invocations.is_empty() {
+                    messages.push(NormalizedMessage {
+                        idx: i64::try_from(messages.len()).unwrap_or(i64::MAX),
+                        role: "assistant".to_string(),
+                        author: Some("copilot".to_string()),
+                        created_at: response_ts,
+                        content,
+                        extra: response.clone(),
+                        invocations,
+                        snippets: Vec::new(),
+                    });
+                }
+            }
+        }
+        if messages.is_empty() {
+            return None;
+        }
+        let title = session
+            .get("customTitle")
+            .or_else(|| session.get("computedTitle"))
+            .and_then(Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                messages
+                    .iter()
+                    .find(|message| message.role == "user")
+                    .map(|message| {
+                        message
+                            .content
+                            .lines()
+                            .next()
+                            .unwrap_or(&message.content)
+                            .chars()
+                            .take(120)
+                            .collect()
+                    })
+            });
+        Some(NormalizedConversation {
+            agent_slug: "copilot".to_string(),
+            external_id,
+            title,
+            workspace,
+            source_path: source_path.to_path_buf(),
+            started_at,
+            ended_at,
+            metadata: serde_json::json!({"source": "copilot", "storage": storage}),
+            messages,
+        })
+    }
+
+    fn parse_native_session_file(path: &Path) -> Result<Vec<NormalizedConversation>> {
+        let content = fs::read_to_string(path)?;
+        let value = if path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        {
+            replay_operation_log(&content)?
+        } else {
+            serde_json::from_str(&content)?
+        };
+        Ok(Self::parse_native_session_value(
+            &value,
+            path,
+            Self::workspace_for_session(path),
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+            {
+                "vscode-workspace-jsonl"
+            } else {
+                "vscode-workspace-json"
+            },
+        )
+        .into_iter()
+        .collect())
+    }
+
+    #[cfg(feature = "copilot-sqlite")]
+    fn workspace_for_database(path: &Path) -> Option<PathBuf> {
+        let workspace_root = path.parent()?.join("workspace.json");
+        if workspace_root.is_file() {
+            let value: Value =
+                serde_json::from_str(&fs::read_to_string(workspace_root).ok()?).ok()?;
+            if let Some(folder) = value
+                .get("folder")
+                .or_else(|| value.get("workspaceFolder"))
+                .and_then(Value::as_str)
+                .and_then(Self::path_from_uri)
+            {
+                return Some(folder);
+            }
+        }
+        None
+    }
+
+    /// Read VS Code's pre-filesystem `interactive.sessions` storage key.
+    ///
+    /// The key contains one JSON array of real serializable chat sessions.
+    /// `chat.ChatSessionStore.index` is intentionally ignored: it contains
+    /// titles/timing only and cannot reconstruct transcript bodies.
+    #[cfg(feature = "copilot-sqlite")]
+    fn parse_interactive_sessions_db(
+        path: &Path,
+        since_ts: Option<i64>,
+    ) -> Result<Vec<NormalizedConversation>> {
+        let conn = open_with_flags(
+            path.to_string_lossy().as_ref(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .with_context(|| format!("failed to open VS Code state database {}", path.display()))?;
+        let _ = conn.execute("PRAGMA busy_timeout = 5000;");
+        let rows = conn
+            .query_map_collect(
+                "SELECT value FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
+                params![],
+                |row| row.get_typed::<String>(0),
+            )
+            .unwrap_or_default();
+        let workspace = Self::workspace_for_database(path);
+        let mut out = Vec::new();
+        let mut seen = HashSet::new();
+        for raw in rows {
+            let Ok(Value::Array(sessions)) = serde_json::from_str::<Value>(&raw) else {
+                continue;
+            };
+            for session in sessions {
+                let Some(session_id) = session
+                    .get("sessionId")
+                    .or_else(|| session.get("id"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                if !seen.insert(session_id.to_string()) {
+                    continue;
+                }
+                let source_path = path.join(format!("interactive.sessions#{session_id}"));
+                if let Some(conversation) = Self::parse_native_session_value(
+                    &session,
+                    &source_path,
+                    workspace.clone(),
+                    "vscode-interactive-sessions",
+                ) && since_ts
+                    .is_none_or(|since| conversation.ended_at.is_none_or(|end| end >= since))
+                {
+                    out.push(conversation);
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Parse a single JSON file that may contain one or more conversations.
@@ -1054,6 +1650,7 @@ impl Connector for CopilotConnector {
         }
 
         let mut all_conversations = Vec::new();
+        let mut seen_external_ids = HashSet::new();
 
         for root in roots {
             let files = Self::find_conversation_files(&root);
@@ -1069,7 +1666,15 @@ impl Connector for CopilotConnector {
                 }
 
                 // Dispatch to the appropriate parser based on file type.
-                let result = if Self::is_cli_event_log(&file) {
+                let result = if Self::native_session_file(&file) {
+                    Self::parse_native_session_file(&file)
+                } else if !Self::looks_like_copilot_storage(&file) {
+                    // A User root also contains every other extension's
+                    // globalStorage. Copilot's legacy/synthetic parser is
+                    // restricted to high-signal Copilot/CLI paths so a shared
+                    // root cannot leak another provider's transcripts.
+                    Ok(Vec::new())
+                } else if Self::is_cli_event_log(&file) {
                     Self::parse_cli_event_log(&file)
                 } else {
                     Self::parse_conversation_file(&file)
@@ -1082,7 +1687,15 @@ impl Connector for CopilotConnector {
                             conversations = convs.len(),
                             "copilot: parsed conversation file"
                         );
-                        all_conversations.extend(convs);
+                        for conversation in convs {
+                            if conversation
+                                .external_id
+                                .as_ref()
+                                .is_none_or(|id| seen_external_ids.insert(id.clone()))
+                            {
+                                all_conversations.push(conversation);
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::debug!(
@@ -1091,6 +1704,36 @@ impl Connector for CopilotConnector {
                             "copilot: skipping unparseable file"
                         );
                     }
+                }
+            }
+
+            #[cfg(feature = "copilot-sqlite")]
+            for db_path in Self::find_db_files(&root) {
+                if !file_modified_since(&db_path, ctx.since_ts) {
+                    continue;
+                }
+                match Self::parse_interactive_sessions_db(&db_path, ctx.since_ts) {
+                    Ok(convs) => {
+                        tracing::debug!(
+                            file = %db_path.display(),
+                            conversations = convs.len(),
+                            "copilot: parsed VS Code interactive.sessions database"
+                        );
+                        for conversation in convs {
+                            if conversation
+                                .external_id
+                                .as_ref()
+                                .is_none_or(|id| seen_external_ids.insert(id.clone()))
+                            {
+                                all_conversations.push(conversation);
+                            }
+                        }
+                    }
+                    Err(error) => tracing::debug!(
+                        file = %db_path.display(),
+                        error = %error,
+                        "copilot: skipping unreadable VS Code state database"
+                    ),
                 }
             }
         }
@@ -1107,6 +1750,10 @@ impl Connector for CopilotConnector {
 mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
+    #[cfg(feature = "copilot-sqlite")]
+    use crate::connectors::sqlite_sync::ConnectionExt;
+    #[cfg(feature = "copilot-sqlite")]
+    use frankensqlite::params;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -1144,6 +1791,200 @@ mod tests {
         let ctx = ScanContext::local_default(root, None);
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn scan_native_workspace_jsonl_replays_operations_and_resolves_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("Code/User/workspaceStorage/workspace-a");
+        let sessions = workspace.join("chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_json(
+            &workspace,
+            "workspace.json",
+            r#"{"folder":"file:///workspaces/demo%20project"}"#,
+        );
+        let initial = serde_json::json!({
+            "version": 3,
+            "creationDate": 1_700_000_000_000_i64,
+            "customTitle": null,
+            "sessionId": "native-jsonl-001",
+            "responderUsername": "",
+            "requests": [{
+                "requestId": "r1",
+                "timestamp": 1_700_000_000_100_i64,
+                "message": {"text": "first question", "parts": [{"text": "first question"}]},
+                "agent": {"extensionId": {"value": "github.copilot-chat"}},
+                "response": [{"kind": "markdownContent", "content": "first answer"}],
+                "responseTimestamp": 1_700_000_000_200_i64
+            }]
+        });
+        let append_request = serde_json::json!({
+            "requestId": "r2",
+            "timestamp": 1_700_000_000_300_i64,
+            "message": {"text": "second question"},
+            "agent": {"id": "github.copilot-chat"},
+            "response": [{
+                "kind": "toolInvocationSerialized",
+                "toolId": "terminal",
+                "toolCallId": "call-2"
+            }],
+            "responseTimestamp": 1_700_000_000_400_i64
+        });
+        let content = format!(
+            "{}\n{}\n{}\n",
+            serde_json::json!({"kind": 0, "v": initial}),
+            serde_json::json!({"kind": 1, "k": ["customTitle"], "v": "Native chat"}),
+            serde_json::json!({"kind": 2, "k": ["requests"], "v": [append_request]})
+        );
+        write_json(&sessions, "native-jsonl-001.jsonl", &content);
+
+        let connector = CopilotConnector::new();
+        let ctx = ScanContext::with_roots(
+            tmp.path().join("cass"),
+            vec![ScanRoot::local(tmp.path().join("Code/User"))],
+            None,
+        );
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("native-jsonl-001"));
+        assert_eq!(convs[0].title.as_deref(), Some("Native chat"));
+        assert_eq!(
+            convs[0].workspace,
+            Some(PathBuf::from("/workspaces/demo project"))
+        );
+        assert_eq!(convs[0].messages.len(), 4);
+        assert_eq!(convs[0].messages[0].content, "first question");
+        assert_eq!(convs[0].messages[1].content, "first answer");
+        assert_eq!(convs[0].messages[3].invocations[0].name, "terminal");
+        assert_eq!(
+            convs[0].messages[3].invocations[0].call_id.as_deref(),
+            Some("call-2")
+        );
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn native_workspace_sessions_fail_closed_for_ambiguous_agents() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join("workspaceStorage/ws/chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let session = serde_json::json!({
+            "version": 3,
+            "sessionId": "ambiguous",
+            "requests": [{
+                "requestId": "r1",
+                "message": "hello",
+                "response": ["reply"]
+            }]
+        });
+        write_json(&sessions, "ambiguous.json", &session.to_string());
+
+        let connector = CopilotConnector::new();
+        let convs = connector
+            .scan(&ScanContext::local_default(
+                tmp.path().join("workspaceStorage"),
+                None,
+            ))
+            .unwrap();
+        assert!(convs.is_empty());
+    }
+
+    #[test]
+    fn native_workspace_sessions_ignore_malformed_tail_but_not_middle_corruption() {
+        let tmp = TempDir::new().unwrap();
+        let sessions = tmp.path().join("workspaceStorage/ws/chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let snapshot = serde_json::json!({
+            "sessionId": "tail",
+            "requests": [{
+                "requestId": "r1",
+                "message": "hello",
+                "agent": {"id": "github.copilot-chat"},
+                "response": ["reply"]
+            }]
+        });
+        let valid = serde_json::json!({"kind": 0, "v": snapshot}).to_string();
+        write_json(
+            &sessions,
+            "tail.jsonl",
+            &format!("{valid}\n{{\"kind\":1,\"k\":[\"customTitle\"],\"v\":\n"),
+        );
+        let connector = CopilotConnector::new();
+        let root = tmp.path().join("workspaceStorage");
+        assert_eq!(
+            connector
+                .scan(&ScanContext::local_default(root.clone(), None))
+                .unwrap()
+                .len(),
+            1
+        );
+        write_json(
+            &sessions,
+            "middle.jsonl",
+            &format!(
+                "{valid}\nnot-json\n{}\n",
+                serde_json::json!({"kind": 1, "k": ["customTitle"], "v": "ignored"})
+            ),
+        );
+        let convs = connector
+            .scan(&ScanContext::local_default(root, None))
+            .unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("tail"));
+    }
+
+    #[cfg(feature = "copilot-sqlite")]
+    #[test]
+    fn scan_native_interactive_sessions_sqlite_and_deduplicates_file_copy() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("Code/User/workspaceStorage/ws");
+        let sessions = workspace.join("chatSessions");
+        fs::create_dir_all(&sessions).unwrap();
+        write_json(
+            &workspace,
+            "workspace.json",
+            r#"{"folder":"file:///db/work"}"#,
+        );
+        let session = serde_json::json!({
+            "sessionId": "sqlite-session",
+            "responderUsername": "GitHub Copilot",
+            "requests": [{"requestId": "r1", "message": "from sqlite", "response": ["reply"]}]
+        });
+        let db_path = workspace.join("state.vscdb");
+        let conn =
+            crate::connectors::sqlite_sync::Connection::open(db_path.to_string_lossy().as_ref())
+                .unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)")
+            .unwrap();
+        conn.execute_compat(
+            "INSERT INTO ItemTable (key, value) VALUES (?, ?)",
+            params![
+                "interactive.sessions",
+                serde_json::json!([session]).to_string()
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        write_json(
+            &sessions,
+            "sqlite-session.json",
+            &serde_json::json!({
+                "sessionId": "sqlite-session",
+                "responderUsername": "GitHub Copilot",
+                "requests": [{"requestId": "r1", "message": "from file", "response": ["reply"]}]
+            })
+            .to_string(),
+        );
+
+        let connector = CopilotConnector::new();
+        let ctx = ScanContext::local_default(tmp.path().join("Code/User"), None);
+        let convs = connector.scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("sqlite-session"));
+        assert!(convs[0].source_path.ends_with("sqlite-session.json"));
+        crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
     }
 
     #[test]

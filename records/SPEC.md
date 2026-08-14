@@ -5,7 +5,7 @@
 - Upstream: https://github.com/Dicklesworthstone/franken_agent_detection
 - Project id: `franken-agent-detection`
 - Operator: LPFchan (GitHub: `LPFchan`)
-- Last updated: 2026-08-13
+- Last updated: 2026-08-15
 
 ## Project thesis
 
@@ -23,6 +23,8 @@ that upstream has not accepted yet.
 - Support Muse Code's Linux XDG session logs, including nested subagents.
 - Support Miniharness JSONL summon sessions from the canonical default root or
   explicit consumer-provided roots.
+- Support GitHub Copilot sessions across VS Code's SQLite, flat-JSON, and
+  append-log generations, including workspace and empty-window storage.
 
 ## Invariants
 
@@ -30,6 +32,8 @@ that upstream has not accepted yet.
 - Provider sequence fields are authoritative when a provider documents them.
 - Unsupported or ambiguous provider data remains raw evidence rather than being
   assigned invented semantics.
+- Shared VS Code chat stores are admitted only when the session identifies a
+  GitHub Copilot agent; index-only metadata is never treated as a transcript.
 - No private transcripts, credentials, or generated build output belong in the
   repository.
 

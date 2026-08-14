@@ -2,7 +2,7 @@
 
 ## Snapshot
 
-- Last updated: 2026-08-13
+- Last updated: 2026-08-15
 - Overall posture: `active`
 - Current focus: Miniharness connector publication and downstream heatmap cutover
 - Highest-priority blocker: none
@@ -15,9 +15,12 @@ The fork is based on upstream commit `7857b2d740dcdcfb4f834f9e394a873fe1796a4d` 
 retains both `origin` (the LPFchan fork) and `upstream` remotes. The repo-template
 scaffold, including the optional upstream-intake module and local hooks, is
 installed. Native Muse and Miniharness support are implemented behind the
-existing `connectors` feature. Miniharness normalizes summon JSONL while
-leaving accounting and visibility policy to consumers. Focused and full
-connector tests pass.
+existing `connectors` feature. The Copilot connector now reads every native VS
+Code transcript generation: `interactive.sessions` in `state.vscdb`, flat chat
+session JSON, and append-log JSONL. It covers workspace and empty-window stores
+while rejecting non-Copilot sessions from the shared VS Code chat store.
+Miniharness normalizes summon JSONL while leaving accounting and visibility
+policy to consumers. Focused and full connector tests pass.
 
 ## Active Phases Or Tracks
 
@@ -54,7 +57,23 @@ connector tests pass.
 - Risks: Consumers must choose their own session-level aggregation and visibility policy.
 - Related ids: none.
 
+### VS Code Copilot storage compatibility
+
+- Goal: Normalize Copilot transcripts from every native VS Code persistence generation.
+- Status: `done`
+- Why this matters now: Recovered Application Support trees contain workspace-scoped history that the old globalStorage-only adapter missed.
+- Current work: Publish the fork commit and let downstream Heatmap refresh from the persistent VS Code tree.
+- Exit criteria: SQLite, flat JSON, append-log JSONL, empty-window storage, Copilot filtering, deduplication, and discovery parity pass tests.
+- Dependencies: VS Code's `interactive.sessions` and `ChatSessionStore` persistence contracts.
+- Risks: Provider-neutral VS Code chat files without Copilot ownership evidence are intentionally skipped.
+- Related ids: VS Code commits `a4ee2666` and `5438d07d`.
+
 ## Recent Changes To Project Reality
+
+- Date: 2026-08-15
+  - Change: Added native VS Code workspace, empty-window, and historical SQLite support to the Copilot connector.
+  - Why it matters: Persistent Application Support trees can replace lossy one-off Copilot imports without missing older database eras.
+  - Related ids: VS Code commits `a4ee2666` and `5438d07d`.
 
 - Date: 2026-08-13
   - Change: Adopted repo-template `1.1.5` and enabled tracked hooks.

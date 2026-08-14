@@ -36,6 +36,7 @@ pub mod pi_agent;
 pub mod qwen;
 pub mod scan;
 #[cfg(any(
+    feature = "copilot-sqlite",
     feature = "cursor",
     feature = "opencode",
     feature = "goose",
@@ -46,6 +47,7 @@ pub mod sqlite_sync;
 pub mod token_extraction;
 pub mod utils;
 pub mod vibe;
+pub(crate) mod vscode_chat;
 pub mod workspace_cache;
 
 #[cfg(test)]

@@ -49,7 +49,12 @@ connectors = [
     "dep:dotenvy",
     "dep:bloomfilter",
     "dep:once_cell",
+    "copilot-sqlite",
 ]
+# VS Code's pre-file chat store uses read-only `state.vscdb` databases. Keep
+# this capability on with the base connector feature so Copilot covers every
+# storage generation without requiring consumers to know an internal feature.
+copilot-sqlite = ["dep:frankensqlite", "dep:asupersync"]
 # ChatGPT: AES-256-GCM decryption for v2/v3 encrypted conversations
 chatgpt = ["connectors", "dep:aes-gcm", "dep:base64"]
 # Cursor: SQLite database access for state.vscdb
