@@ -174,15 +174,34 @@ impl ClaudeCodeConnector {
             .map(str::to_string)
     }
 
+    /// Resolve a Desktop sidecar's workspace without guessing when the
+    /// sidecar records more than one selected folder. A single non-empty
+    /// selection is stronger evidence than the ephemeral Desktop `cwd`.
+    fn desktop_workspace(raw: &Value) -> Option<PathBuf> {
+        let Some(selected) = raw.get("userSelectedFolders") else {
+            return Self::non_empty_json_string(raw, "cwd").map(PathBuf::from);
+        };
+        let Some(selected) = selected.as_array() else {
+            return None;
+        };
+        let folders = selected
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>();
+        (folders.len() == 1).then(|| PathBuf::from(folders[0]))
+    }
+
     fn desktop_sidecar_metadata_message(raw: &Value) -> Option<NormalizedMessage> {
         let title = Self::non_empty_json_string(raw, "title");
-        let cwd = Self::non_empty_json_string(raw, "cwd");
+        let workspace = Self::desktop_workspace(raw);
         let model = Self::non_empty_json_string(raw, "model");
         let cli_session_id = Self::non_empty_json_string(raw, "cliSessionId");
         let session_id = Self::non_empty_json_string(raw, "sessionId");
         let permission_mode = Self::non_empty_json_string(raw, "permissionMode");
         if title.is_none()
-            && cwd.is_none()
+            && workspace.is_none()
             && model.is_none()
             && cli_session_id.is_none()
             && session_id.is_none()
@@ -194,8 +213,8 @@ impl ClaudeCodeConnector {
         if let Some(title) = &title {
             lines.push(format!("Title: {title}"));
         }
-        if let Some(cwd) = &cwd {
-            lines.push(format!("Workspace: {cwd}"));
+        if let Some(workspace) = &workspace {
+            lines.push(format!("Workspace: {}", workspace.display()));
         }
         if let Some(model) = &model {
             lines.push(format!("Model: {model}"));
@@ -593,8 +612,11 @@ fn scan_claude_with_callback_with_exclusions(
 
                 json_title = ClaudeCodeConnector::non_empty_json_string(&val, "title");
                 if workspace.is_none() {
-                    workspace =
-                        ClaudeCodeConnector::non_empty_json_string(&val, "cwd").map(PathBuf::from);
+                    workspace = if ClaudeCodeConnector::path_is_desktop_sidecar(&path) {
+                        ClaudeCodeConnector::desktop_workspace(&val)
+                    } else {
+                        ClaudeCodeConnector::non_empty_json_string(&val, "cwd").map(PathBuf::from)
+                    };
                 }
                 if session_id.is_none() {
                     session_id = ClaudeCodeConnector::non_empty_json_string(&val, "sessionId");
@@ -1156,7 +1178,8 @@ mod tests {
             json!({
                 "sessionId": "local_msg",
                 "cliSessionId": "cli-session-123",
-                "cwd": "/Users/jane/project",
+                "cwd": "/sessions/ephemeral",
+                "userSelectedFolders": ["/Users/jane/project"],
                 "createdAt": 1_773_244_128_013_i64,
                 "lastActivityAt": 1_773_278_849_911_i64,
                 "model": "claude-opus-4-6",
@@ -1207,6 +1230,33 @@ mod tests {
                 .content
                 .contains("culled the CLI JSONL body")
         );
+    }
+
+    #[test]
+    fn desktop_workspace_prefers_one_selected_folder_over_ephemeral_cwd() {
+        let raw = json!({
+            "cwd": "/sessions/ephemeral",
+            "userSelectedFolders": ["", "/Users/yeowool/Documents/Eastself", "  "]
+        });
+        assert_eq!(
+            ClaudeCodeConnector::desktop_workspace(&raw),
+            Some(PathBuf::from("/Users/yeowool/Documents/Eastself"))
+        );
+    }
+
+    #[test]
+    fn desktop_workspace_fails_closed_for_zero_or_multiple_selected_folders() {
+        let empty = json!({
+            "cwd": "/sessions/ephemeral",
+            "userSelectedFolders": []
+        });
+        assert_eq!(ClaudeCodeConnector::desktop_workspace(&empty), None);
+
+        let multiple = json!({
+            "cwd": "/sessions/ephemeral",
+            "userSelectedFolders": ["/Users/yeowool/Documents/Eastself", "/tmp/other"]
+        });
+        assert_eq!(ClaudeCodeConnector::desktop_workspace(&multiple), None);
     }
 
     #[test]

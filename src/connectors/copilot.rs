@@ -608,6 +608,15 @@ impl CopilotConnector {
     }
 
     fn path_from_uri(value: &str) -> Option<PathBuf> {
+        if let Some(remote) = value.strip_prefix("vscode-remote://") {
+            // VS Code's workspace.json stores remote folders as
+            // `vscode-remote://<authority>/<path>`. The authority identifies
+            // the SSH/WSL/container target and is not part of the workspace
+            // path that consumers should use for project matching.
+            let path = remote.get(remote.find('/')?..)?;
+            let decoded = Self::percent_decode(path)?;
+            return Some(PathBuf::from(decoded));
+        }
         let path = value.strip_prefix("file://")?;
         let decoded = Self::percent_decode(path)?;
         // VS Code records Windows file URIs as file:///c%3A/... . Preserve a
@@ -1863,6 +1872,30 @@ mod tests {
             Some("call-2")
         );
         crate::connectors::assert_discovery_covers_scan_sources(&connector, &ctx);
+    }
+
+    #[test]
+    fn path_from_uri_supports_file_and_vscode_remote_forms() {
+        assert_eq!(
+            CopilotConnector::path_from_uri("file:///workspaces/demo%20project"),
+            Some(PathBuf::from("/workspaces/demo project"))
+        );
+        assert_eq!(
+            CopilotConnector::path_from_uri(
+                "vscode-remote://ssh-remote%2Byeowoolmac.local/Users/yeowool/Documents/Eastself"
+            ),
+            Some(PathBuf::from("/Users/yeowool/Documents/Eastself"))
+        );
+        assert_eq!(
+            CopilotConnector::path_from_uri(
+                "vscode-remote://ssh-remote%2B10.0.0.14/Users/yeowool/Documents/Eastself"
+            ),
+            Some(PathBuf::from("/Users/yeowool/Documents/Eastself"))
+        );
+        assert_eq!(
+            CopilotConnector::path_from_uri("vscode-remote://ssh-remote%2Bhost/not%20encoded"),
+            Some(PathBuf::from("/not encoded"))
+        );
     }
 
     #[test]

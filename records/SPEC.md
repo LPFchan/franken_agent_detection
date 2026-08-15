@@ -24,7 +24,13 @@ that upstream has not accepted yet.
 - Support Miniharness JSONL summon sessions from the canonical default root or
   explicit consumer-provided roots.
 - Support GitHub Copilot sessions across VS Code's SQLite, flat-JSON, and
-  append-log generations, including workspace and empty-window storage.
+  append-log generations, including workspace and empty-window storage. VS
+  Code workspace URIs may be local `file://` values or remote
+  `vscode-remote://` values; remote authorities are discarded while their
+  decoded workspace paths are retained.
+- Prefer a Claude Code Desktop sidecar's sole non-empty `userSelectedFolders`
+  entry over its ephemeral `cwd`; zero or multiple selected folders remain
+  unassigned rather than being guessed.
 
 ## Invariants
 
@@ -32,6 +38,8 @@ that upstream has not accepted yet.
 - Provider sequence fields are authoritative when a provider documents them.
 - Unsupported or ambiguous provider data remains raw evidence rather than being
   assigned invented semantics.
+- Ambiguous Desktop workspace selections remain unassigned rather than being
+  assigned an inferred path.
 - Shared VS Code chat stores are admitted only when the session identifies a
   GitHub Copilot agent; index-only metadata is never treated as a transcript.
 - No private transcripts, credentials, or generated build output belong in the
