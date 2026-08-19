@@ -2,7 +2,7 @@
 
 ## Snapshot
 
-- Last updated: 2026-08-15
+- Last updated: 2026-08-19
 - Overall posture: `active`
 - Current focus: Miniharness connector publication and downstream heatmap cutover
 - Highest-priority blocker: none
@@ -20,7 +20,9 @@ Code transcript generation: `interactive.sessions` in `state.vscdb`, flat chat
 session JSON, and append-log JSONL. It covers workspace and empty-window stores
 while rejecting non-Copilot sessions from the shared VS Code chat store.
 Miniharness normalizes summon JSONL while leaving accounting and visibility
-policy to consumers. Focused and full connector tests pass.
+policy to consumers. SQLite-backed connectors use bundled `rusqlite`; the
+restricted `fsqlite` and `asupersync` dependency family is no longer present.
+Focused connector tests, feature checks, formatting, and lint checks pass.
 
 ## Active Phases Or Tracks
 
@@ -69,6 +71,11 @@ policy to consumers. Focused and full connector tests pass.
 - Related ids: VS Code commits `a4ee2666` and `5438d07d`.
 
 ## Recent Changes To Project Reality
+
+- Date: 2026-08-19
+  - Change: Replaced the optional `fsqlite` and `asupersync` stack with bundled `rusqlite` across all SQLite-backed connectors.
+  - Why it matters: Public consumers can use the connectors without inheriting the restricted Franken dependency rider, while retaining embedded SQLite builds.
+  - Related ids: none.
 
 - Date: 2026-08-15
   - Change: Added native VS Code workspace, empty-window, and historical SQLite support to the Copilot connector.

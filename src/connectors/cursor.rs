@@ -29,8 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
-use frankensqlite::params;
+use rusqlite::{OpenFlags, params};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde_json::{Map, Value};
@@ -358,8 +357,8 @@ impl CursorConnector {
             "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ?",
             params![prefix.as_str(), limit.as_str()],
             |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
                 Ok((key, value))
             },
         ) {
@@ -461,13 +460,13 @@ impl CursorConnector {
         let composer_limit = Self::prefix_upper_bound(composer_prefix);
         if let Ok(rows) = conn.query_map_collect(
             // Filter out NULL-value rows: Cursor inserts internal markers with no
-            // chat payload, and `row.get_typed(1)?` on NULL aborts the whole
+            // chat payload, and `row.get::<_, String>(1)?` on NULL aborts the whole
             // query_map_collect — silently turning every row into zero conversations.
             "SELECT key, value FROM cursorDiskKV WHERE key >= ? AND key < ? AND value IS NOT NULL",
             params![composer_prefix, composer_limit.as_str()],
             |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
                 Ok((key, value))
             },
         ) {
@@ -490,8 +489,8 @@ impl CursorConnector {
             "SELECT key, value FROM ItemTable WHERE (key LIKE '%aichat%chatdata%' OR key LIKE '%composer%') AND value IS NOT NULL",
             params![],
             |row| {
-                let key: String = row.get_typed(0)?;
-                let value: String = row.get_typed(1)?;
+                let key: String = row.get(0)?;
+                let value: String = row.get(1)?;
                 Ok((key, value))
             },
         ) {
@@ -1291,7 +1290,7 @@ mod tests {
     use super::*;
     use crate::connectors::scan::ScanRoot;
     use crate::connectors::sqlite_sync::ConnectionExt;
-    use frankensqlite::params;
+    use rusqlite::params;
     use serde_json::json;
     use std::collections::HashSet;
     use std::fs;
@@ -1971,7 +1970,7 @@ mod tests {
     }
 
     // Cursor inserts internal marker rows into `cursorDiskKV` with NULL `value`
-    // (e.g. composer metadata stubs). Without filtering, `row.get_typed::<String>(1)?`
+    // (e.g. composer metadata stubs). Without filtering, `row.get::<_, String>(1)?`
     // on NULL aborts the row mapper, the `if let Ok(rows) = ...` swallows the error,
     // and the whole connector silently returns zero conversations. Regression test:
     // a single NULL row must not mask the valid rows beside it. (PR #8)

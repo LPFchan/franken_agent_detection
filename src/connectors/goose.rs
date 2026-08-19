@@ -22,8 +22,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
-use frankensqlite::{Row, SqliteValue, params};
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{OpenFlags, Row, params};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 use serde::Deserialize;
@@ -373,14 +373,14 @@ impl GooseConnector {
                 params![],
                 |row| {
                     Ok(GooseSqliteSession {
-                        id: row.get_typed(0)?,
-                        description: row.get_typed(1)?,
-                        working_dir: row.get_typed(2)?,
+                        id: row.get(0)?,
+                        description: row.get(1)?,
+                        working_dir: row.get(2)?,
                         created_at: optional_sqlite_value(row, 3),
                         updated_at: optional_sqlite_value(row, 4),
-                        provider_name: row.get_typed(5)?,
-                        model_config_json: row.get_typed(6)?,
-                        session_type: row.get_typed(7)?,
+                        provider_name: row.get(5)?,
+                        model_config_json: row.get(6)?,
+                        session_type: row.get(7)?,
                     })
                 },
             )
@@ -473,12 +473,12 @@ impl GooseConnector {
             params![session_id],
             |row| {
                 Ok(GooseSqliteMessage {
-                    message_id: row.get_typed(0)?,
-                    role: row.get_typed(1)?,
-                    content_json: row.get_typed(2)?,
+                    message_id: row.get(0)?,
+                    role: row.get(1)?,
+                    content_json: row.get(2)?,
                     created_timestamp: optional_sqlite_value(row, 3),
-                    tokens: row.get_typed(4)?,
-                    metadata_json: row.get_typed(5)?,
+                    tokens: row.get(4)?,
+                    metadata_json: row.get(5)?,
                 })
             },
         )?;
@@ -748,14 +748,10 @@ fn looks_like_goose_sessions(path: &Path) -> bool {
     false
 }
 
-fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+fn optional_sqlite_value(row: &Row<'_>, index: usize) -> Option<SqliteValue> {
+    row.get::<_, SqliteValue>(index)
+        .ok()
+        .filter(|value| !matches!(value, SqliteValue::Null))
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -767,7 +763,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_goose_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_goose_timestamp(Some(*i)),
-        SqliteValue::Float(f) => {
+        SqliteValue::Real(f) => {
             if f.is_nan() || f.is_infinite() {
                 return None;
             }
@@ -1342,7 +1338,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         let result = normalize_goose_ts_value(&val);
         assert!(result.is_some());
         assert_eq!(result.unwrap(), 1_700_000_000_500);

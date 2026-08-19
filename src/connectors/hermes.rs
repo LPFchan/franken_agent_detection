@@ -23,8 +23,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, RowExt};
-use frankensqlite::params;
+use rusqlite::{OpenFlags, params};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 
@@ -149,18 +148,18 @@ impl HermesConnector {
                 params![],
                 |row| {
                     Ok(HermesSession {
-                        id: row.get_typed(0)?,
-                        source: row.get_typed(1)?,
-                        model: row.get_typed(2)?,
-                        title: row.get_typed(3)?,
-                        parent_session_id: row.get_typed(4)?,
-                        started_at: row.get_typed(5)?,
-                        ended_at: row.get_typed(6)?,
-                        end_reason: row.get_typed(7)?,
-                        message_count: row.get_typed(8)?,
-                        tool_call_count: row.get_typed(9)?,
-                        input_tokens: row.get_typed(10)?,
-                        output_tokens: row.get_typed(11)?,
+                        id: row.get(0)?,
+                        source: row.get(1)?,
+                        model: row.get(2)?,
+                        title: row.get(3)?,
+                        parent_session_id: row.get(4)?,
+                        started_at: row.get(5)?,
+                        ended_at: row.get(6)?,
+                        end_reason: row.get(7)?,
+                        message_count: row.get(8)?,
+                        tool_call_count: row.get(9)?,
+                        input_tokens: row.get(10)?,
+                        output_tokens: row.get(11)?,
                     })
                 },
             )
@@ -240,13 +239,13 @@ impl HermesConnector {
             params![session_id],
             |row| {
                 Ok(HermesMessage {
-                    role: row.get_typed(0)?,
-                    content: row.get_typed(1)?,
-                    tool_calls: row.get_typed(2)?,
-                    tool_name: row.get_typed(3)?,
-                    tool_call_id: row.get_typed(4)?,
-                    reasoning: row.get_typed(5)?,
-                    timestamp: row.get_typed(6)?,
+                    role: row.get(0)?,
+                    content: row.get(1)?,
+                    tool_calls: row.get(2)?,
+                    tool_name: row.get(3)?,
+                    tool_call_id: row.get(4)?,
+                    reasoning: row.get(5)?,
+                    timestamp: row.get(6)?,
                 })
             },
         )?;

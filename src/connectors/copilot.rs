@@ -54,9 +54,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 #[cfg(feature = "copilot-sqlite")]
-use frankensqlite::compat::{OpenFlags, RowExt};
-#[cfg(feature = "copilot-sqlite")]
-use frankensqlite::params;
+use rusqlite::{OpenFlags, params};
 use serde_json::Value;
 use walkdir::WalkDir;
 
@@ -935,7 +933,7 @@ impl CopilotConnector {
             .query_map_collect(
                 "SELECT value FROM ItemTable WHERE key = 'interactive.sessions' AND value IS NOT NULL",
                 params![],
-                |row| row.get_typed::<String>(0),
+                |row| row.get::<_, String>(0),
             )
             .unwrap_or_default();
         let workspace = Self::workspace_for_database(path);
@@ -1762,7 +1760,7 @@ mod tests {
     #[cfg(feature = "copilot-sqlite")]
     use crate::connectors::sqlite_sync::ConnectionExt;
     #[cfg(feature = "copilot-sqlite")]
-    use frankensqlite::params;
+    use rusqlite::params;
     use std::path::PathBuf;
     use tempfile::TempDir;
 

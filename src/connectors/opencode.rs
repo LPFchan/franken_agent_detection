@@ -32,8 +32,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use frankensqlite::compat::{OpenFlags, ParamValue, RowExt};
-use frankensqlite::{Row, SqliteValue, params};
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{OpenFlags, Row, params, params_from_iter};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
 
@@ -494,10 +494,10 @@ impl OpenCodeConnector {
                 params![],
                 |row| {
                     Ok(SqliteSession {
-                        id: row.get_typed(0)?,
-                        title: row.get_typed(1)?,
-                        directory: row.get_typed(2)?,
-                        project_id: row.get_typed(3)?,
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        directory: row.get(2)?,
+                        project_id: row.get(3)?,
                         time_created_raw: optional_sqlite_value(row, 4),
                         time_updated_raw: optional_sqlite_value(row, 5),
                     })
@@ -610,9 +610,9 @@ impl OpenCodeConnector {
                 params![],
                 |row| {
                     Ok(SqliteMessageRow {
-                        session_id: row.get_typed(0)?,
-                        id: row.get_typed(1)?,
-                        data_json: row.get_typed(2)?,
+                        session_id: row.get(0)?,
+                        id: row.get(1)?,
+                        data_json: row.get(2)?,
                         time_created_raw: optional_sqlite_value(row, 3),
                     })
                 },
@@ -625,18 +625,22 @@ impl OpenCodeConnector {
                     let sql = format!(
                         "SELECT session_id, id, data, time_created FROM message WHERE session_id IN ({placeholders})"
                     );
-                    let bind: Vec<ParamValue> = chunk
+                    let bind: Vec<SqliteValue> = chunk
                         .iter()
-                        .map(|id| ParamValue::from(id.as_str()))
+                        .map(|id| SqliteValue::Text((*id).clone()))
                         .collect();
-                    rows.extend(conn.query_map_collect(&sql, &bind, |row| {
-                        Ok(SqliteMessageRow {
-                            session_id: row.get_typed(0)?,
-                            id: row.get_typed(1)?,
-                            data_json: row.get_typed(2)?,
-                            time_created_raw: optional_sqlite_value(row, 3),
-                        })
-                    })?);
+                    rows.extend(conn.query_map_collect(
+                        &sql,
+                        params_from_iter(bind.iter()),
+                        |row| {
+                            Ok(SqliteMessageRow {
+                                session_id: row.get(0)?,
+                                id: row.get(1)?,
+                                data_json: row.get(2)?,
+                                time_created_raw: optional_sqlite_value(row, 3),
+                            })
+                        },
+                    )?);
                 }
                 rows
             }
@@ -741,7 +745,7 @@ impl OpenCodeConnector {
         let rows: Vec<(String, String)> = match message_ids {
             None => {
                 conn.query_map_collect("SELECT message_id, data FROM part", params![], |row| {
-                    Ok((row.get_typed(0)?, row.get_typed(1)?))
+                    Ok((row.get(0)?, row.get(1)?))
                 })?
             }
             Some(ids) => {
@@ -752,13 +756,15 @@ impl OpenCodeConnector {
                     let sql = format!(
                         "SELECT message_id, data FROM part WHERE message_id IN ({placeholders})"
                     );
-                    let bind: Vec<ParamValue> = chunk
+                    let bind: Vec<SqliteValue> = chunk
                         .iter()
-                        .map(|id| ParamValue::from(id.as_str()))
+                        .map(|id| SqliteValue::Text((*id).clone()))
                         .collect();
-                    rows.extend(conn.query_map_collect(&sql, &bind, |row| {
-                        Ok((row.get_typed(0)?, row.get_typed(1)?))
-                    })?);
+                    rows.extend(conn.query_map_collect(
+                        &sql,
+                        params_from_iter(bind.iter()),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?);
                 }
                 rows
             }
@@ -1161,14 +1167,10 @@ fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
     })
 }
 
-fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
-    row.get(index).and_then(|value| {
-        if matches!(value, SqliteValue::Null) {
-            None
-        } else {
-            Some(value.clone())
-        }
-    })
+fn optional_sqlite_value(row: &Row<'_>, index: usize) -> Option<SqliteValue> {
+    row.get::<_, SqliteValue>(index)
+        .ok()
+        .filter(|value| !matches!(value, SqliteValue::Null))
 }
 
 /// Normalize a raw SQLite value to epoch milliseconds.
@@ -1181,7 +1183,7 @@ fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
 fn normalize_sqlite_ts_value(val: &SqliteValue) -> Option<i64> {
     match val {
         SqliteValue::Integer(i) => normalize_opencode_timestamp(Some(*i)),
-        SqliteValue::Float(f) => normalize_opencode_timestamp(Some(*f as i64)),
+        SqliteValue::Real(f) => normalize_opencode_timestamp(Some(*f as i64)),
         SqliteValue::Text(s) => {
             // Try common SQLite/Drizzle datetime formats (space separator)
             if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
@@ -3633,7 +3635,7 @@ mod tests {
 
     #[test]
     fn normalize_sqlite_ts_value_real() {
-        let val = SqliteValue::Float(1_700_000_000.5);
+        let val = SqliteValue::Real(1_700_000_000.5);
         assert_eq!(normalize_sqlite_ts_value(&val), Some(1_700_000_000_000));
     }
 
