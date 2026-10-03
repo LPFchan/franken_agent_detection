@@ -16,4 +16,10 @@ This exists to stop the same `accept`, `adapt`, `decline`, or `defer` question f
 
 ## Current Entries
 
-Seed this section after the first real upstream intake review.
+- Candidate area: FAD upstream synchronization
+- First decision date: 2026-10-04
+- Most recent confirmation date: 2026-10-04
+- Current standing decision: `adapt`
+- Carry-forward rationale: Prefer upstream Muse and Copilot implementations; preserve Miniharness, bundled rusqlite, attribution, explicit scan boundaries, and legacy transcript compatibility until upstream equivalents pass consumer fixtures.
+- What new evidence would justify reopening this: Upstream covers a remaining override, an acceptable SQLite dependency backend appears, or verified provider schemas require a change.
+- Related report, ADR, or note: UPS-20261004-001.

@@ -4,7 +4,7 @@
 
 - Last updated: 2026-10-04
 - Overall posture: `active`
-- Current focus: upstream v0.3.3 synchronization and downstream Heatmap cutover
+- Current focus: downstream Heatmap cutover after the published v0.3.3 integration
 - Highest-priority blocker: none
 - Next operator decision needed: none
 - Related ids: UPS-20261004-001
@@ -36,6 +36,6 @@ roots bound scans and discovery; temporary-store tests do not read real history.
 
 ## Immediate Next Steps
 
-- Publish this ancestry-preserving integration and pin it in Heatmap.
+- Complete the Heatmap cutover to published integration `c416a920b445f9e9e468eeefd25c48314afb8461`.
 - Keep future local changes registered in the override list and test consumers
   whenever upstream changes normalization or optional feature gates.

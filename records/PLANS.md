@@ -20,7 +20,7 @@
 
 ### Near Term
 
-- Initiative: Publish the v0.3.3 integration and update Heatmap's pinned dependency,
+- Initiative: Update Heatmap's pinned dependency to the published v0.3.3 integration,
   retaining `copilot-vscdb` for legacy SQLite transcripts.
 
 ### Deferred But Accepted
