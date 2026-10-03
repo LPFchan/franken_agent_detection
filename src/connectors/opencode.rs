@@ -32,10 +32,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use rusqlite::types::Value as SqliteValue;
-use rusqlite::{OpenFlags, Row, params, params_from_iter};
+use rusqlite::{OpenFlags, types::Value as ParamValue};
+use rusqlite::{Row, params, types::Value as SqliteValue};
 
 use super::sqlite_sync::{Connection, ConnectionExt, open_with_flags};
+use super::utils::read_capped;
 
 /// Max ids bound into a single `... IN (?, ?, …)` chunk. Kept well under
 /// SQLite's default 999-parameter ceiling. (#372: incremental opencode scans
@@ -122,15 +123,10 @@ impl OpenCodeConnector {
         None
     }
 
-    /// Home/XDG DB discovery is only valid when every supplied scan root
-    /// refers to this machine. A remote-mirror root must never pull the
-    /// local canonical `opencode.db` into its scan — the caller attributes
-    /// everything returned by that invocation to the remote source, so the
-    /// local sessions would be double-indexed under the remote `source_id`
-    /// (cass#357). Vacuously true when `scan_roots` is empty, preserving
-    /// default detection and the issue #174 local-explicit-root behavior.
+    /// Home/XDG databases belong to default local discovery. Explicit roots
+    /// are a scan boundary, including local roots and remote mirrors.
     fn allow_local_default_dbs(ctx: &ScanContext) -> bool {
-        ctx.scan_roots.iter().all(|root| root.origin.is_local())
+        ctx.use_default_detection() && ctx.scan_roots.iter().all(|root| root.origin.is_local())
     }
 
     /// All known locations where OpenCode may store its SQLite database,
@@ -485,25 +481,24 @@ impl OpenCodeConnector {
         conn.execute("PRAGMA busy_timeout = 5000;")
             .with_context(|| "failed to set busy_timeout")?;
 
-        // Query all sessions. Read timestamps as raw SQLite values — Drizzle ORM may
-        // store them as ISO text (YYYY-MM-DD HH:MM:SS) or epoch integers depending on config.
-        // We normalize in Rust rather than using strftime() which breaks on integer columns.
-        let sessions: Vec<SqliteSession> = conn
-            .query_map_collect(
-                "SELECT id, title, directory, project_id, time_created, time_updated FROM session",
-                params![],
-                |row| {
-                    Ok(SqliteSession {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        directory: row.get(2)?,
-                        project_id: row.get(3)?,
-                        time_created_raw: optional_sqlite_value(row, 4),
-                        time_updated_raw: optional_sqlite_value(row, 5),
-                    })
-                },
-            )
-            .with_context(|| "failed to query OpenCode sessions")?;
+        // OpenCode 2.0.x keeps its sessions in `session_v2` and their transcripts in
+        // `session_message`, next to the 1.x `session`/`message`/`part` tables; a
+        // 1.x session migrated to 2.x keeps its id in both. Later 2.x builds keep
+        // 2.x sessions in `session` itself, still with `session_message`
+        // transcripts (cass GH #504). `session_v2` rows come first so a migrated
+        // session keeps its 2.x metadata when `seen_ids` below drops the 1.x row.
+        let has_session_v2 = sqlite_table_exists(&conn, "session_v2")?;
+        let has_session_message = sqlite_table_exists(&conn, "session_message")?;
+        let mut sessions: Vec<SqliteSession> = Vec::new();
+        if has_session_v2 {
+            sessions.extend(Self::load_sqlite_sessions(&conn, "session_v2")?);
+        }
+        // Without 2.x tables the 1.x `session` table is required, as before.
+        if !has_session_v2 || sqlite_table_exists(&conn, "session")? {
+            sessions.extend(Self::load_sqlite_sessions(&conn, "session")?);
+        }
+        let has_v1_messages = !has_session_message
+            || (sqlite_table_exists(&conn, "message")? && sqlite_table_exists(&conn, "part")?);
 
         // #372: on an incremental scan, restrict the (expensive) message/part
         // decode to the sessions that could possibly clear the cutoff, instead
@@ -522,14 +517,30 @@ impl OpenCodeConnector {
                         .time_updated_raw
                         .as_ref()
                         .and_then(normalize_sqlite_ts_value)
-                        .map_or(true, |updated| updated >= since)
+                        // Same −1s mtime-granularity slack as
+                        // file_modified_since, so a session touched within
+                        // the slack window is not skipped on every
+                        // subsequent incremental scan.
+                        .is_none_or(|updated| updated >= since.saturating_sub(1_000))
                 })
                 .map(|session| session.id.clone())
                 .collect()
         });
 
-        let mut messages_by_session =
-            Self::load_sqlite_messages_by_session(&conn, keep_session_ids.as_ref(), progress_tick)?;
+        let mut messages_by_session = if has_v1_messages {
+            Self::load_sqlite_messages_by_session(&conn, keep_session_ids.as_ref(), progress_tick)?
+        } else {
+            HashMap::new()
+        };
+        let mut v2_messages_by_session = if has_session_message {
+            Self::load_sqlite_v2_messages_by_session(
+                &conn,
+                keep_session_ids.as_ref(),
+                progress_tick,
+            )?
+        } else {
+            HashMap::new()
+        };
         let mut convs = Vec::new();
         let mut seen_ids = HashSet::new();
 
@@ -539,7 +550,13 @@ impl OpenCodeConnector {
                 continue;
             }
 
-            let messages = messages_by_session.remove(&session.id).unwrap_or_default();
+            // A session with a 2.x transcript is read from it; the 1.x rows a
+            // migration left behind for the same id are not indexed twice.
+            let v1_messages = messages_by_session.remove(&session.id).unwrap_or_default();
+            let (messages, schema) = match v2_messages_by_session.remove(&session.id) {
+                Some(v2_messages) if !v2_messages.is_empty() => (v2_messages, "v2"),
+                _ => (v1_messages, "v1"),
+            };
             if messages.is_empty() {
                 continue;
             }
@@ -560,12 +577,16 @@ impl OpenCodeConnector {
             let ended_at = session_updated_ms.or(msg_ended_at).or(started_at);
 
             // Filter by since_ts in Rust (can't reliably filter in SQL when
-            // timestamp column format is unknown).
-            if let Some(since) = since_ts {
-                let latest = ended_at.or(started_at).unwrap_or(0);
-                if latest < since {
-                    continue;
-                }
+            // timestamp column format is unknown). Sessions whose timestamps
+            // are ALL unparseable must stay: pruning them on latest=0 would
+            // drop them from every incremental scan forever (the flat-file
+            // path guards this blind spot with mtimes; SQLite rows have no
+            // such fallback). Only KNOWN-old sessions are pruned.
+            if let Some(since) = since_ts
+                && let Some(latest) = ended_at.or(started_at)
+                && latest < since.saturating_sub(1_000)
+            {
+                continue;
             }
 
             let workspace = session.directory.map(PathBuf::from);
@@ -588,12 +609,145 @@ impl OpenCodeConnector {
                     "session_id": session.id,
                     "project_id": session.project_id,
                     "source": "sqlite",
+                    "opencode_schema": schema,
                 }),
                 messages,
             });
         }
 
         Ok(convs)
+    }
+
+    /// Session rows from `table` (`session` or `session_v2`). Timestamps are read
+    /// as raw SQLite values: Drizzle ORM may store them as ISO text
+    /// (YYYY-MM-DD HH:MM:SS) or epoch integers depending on config, and we
+    /// normalize in Rust rather than with strftime(), which breaks on integers.
+    fn load_sqlite_sessions(conn: &Connection, table: &str) -> Result<Vec<SqliteSession>> {
+        conn.query_map_collect(
+            // `id IS NOT NULL`: SQLite PRIMARY KEYs do not imply NOT NULL, and
+            // one NULL/BLOB id aborts the whole row collect — dropping every
+            // conversation in the store.
+            &format!(
+                "SELECT id, title, directory, project_id, time_created, time_updated FROM {table} WHERE id IS NOT NULL"
+            ),
+            params![],
+            |row| {
+                Ok(SqliteSession {
+                    id: row.get(0)?,
+                    title: row.get(1)?,
+                    directory: row.get(2)?,
+                    project_id: row.get(3)?,
+                    time_created_raw: optional_sqlite_value(row, 4),
+                    time_updated_raw: optional_sqlite_value(row, 5),
+                })
+            },
+        )
+        .with_context(|| format!("failed to query OpenCode sessions from {table}"))
+    }
+
+    /// OpenCode 2.x transcripts from `session_message`, grouped by session and
+    /// ordered by the per-session `seq` OpenCode itself pages by (cass GH #504).
+    fn load_sqlite_v2_messages_by_session(
+        conn: &Connection,
+        keep_session_ids: Option<&HashSet<String>>,
+        progress_tick: Option<&(dyn Fn() + Send + Sync)>,
+    ) -> Result<HashMap<String, Vec<NormalizedMessage>>> {
+        const SELECT: &str = "SELECT session_id, id, type, seq, data, time_created FROM session_message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND type IS NOT NULL";
+        let map_row = |row: &Row| -> Result<SqliteV2MessageRow, rusqlite::Error> {
+            Ok(SqliteV2MessageRow {
+                session_id: row.get(0)?,
+                id: row.get(1)?,
+                message_type: row.get(2)?,
+                seq: row.get(3)?,
+                data_json: row.get(4)?,
+                time_created_raw: optional_sqlite_value(row, 5),
+            })
+        };
+        let rows: Vec<SqliteV2MessageRow> = match keep_session_ids {
+            None => conn.query_map_collect(SELECT, params![], map_row)?,
+            Some(ids) => {
+                let id_list: Vec<&String> = ids.iter().collect();
+                let mut rows = Vec::new();
+                for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
+                    let placeholders = vec!["?"; chunk.len()].join(",");
+                    let sql = format!("{SELECT} AND session_id IN ({placeholders})");
+                    let bind: Vec<ParamValue> = chunk
+                        .iter()
+                        .map(|id| ParamValue::from((*id).clone()))
+                        .collect();
+                    rows.extend(conn.query_map_collect(
+                        &sql,
+                        rusqlite::params_from_iter(&bind),
+                        map_row,
+                    )?);
+                }
+                rows
+            }
+        };
+
+        let mut pending_by_session: HashMap<String, Vec<(Option<i64>, String, NormalizedMessage)>> =
+            HashMap::new();
+        for (row_index, row) in rows.into_iter().enumerate() {
+            opencode_scan_tick(progress_tick, row_index);
+            let data: serde_json::Value = match serde_json::from_str(&row.data_json) {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::debug!(
+                        "opencode sqlite: failed to parse session_message data for {}: {e}",
+                        row.id
+                    );
+                    continue;
+                }
+            };
+            let Some((role, author, content)) = v2_message_content(&row.message_type, &data) else {
+                continue;
+            };
+            if content.trim().is_empty() {
+                continue;
+            }
+            let col_ts = row
+                .time_created_raw
+                .as_ref()
+                .and_then(normalize_sqlite_ts_value);
+            let created_at = normalize_opencode_timestamp(
+                data.pointer("/time/created")
+                    .and_then(serde_json::Value::as_i64),
+            )
+            .or(col_ts);
+            let message = NormalizedMessage {
+                idx: 0,
+                role: role.to_string(),
+                author,
+                created_at,
+                content,
+                extra: serde_json::json!({
+                    "message_id": row.id,
+                    "session_id": row.session_id,
+                    "type": row.message_type,
+                    "seq": row.seq,
+                }),
+                invocations: Vec::new(),
+                snippets: Vec::new(),
+            };
+            pending_by_session
+                .entry(row.session_id)
+                .or_default()
+                .push((row.seq, row.id, message));
+        }
+
+        let mut messages_by_session = HashMap::new();
+        for (session_id, mut pending) in pending_by_session {
+            pending.sort_by(|a, b| {
+                a.0.unwrap_or(i64::MAX)
+                    .cmp(&b.0.unwrap_or(i64::MAX))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let mut messages: Vec<NormalizedMessage> =
+                pending.into_iter().map(|(_, _, message)| message).collect();
+            crate::types::reindex_messages(&mut messages);
+            messages_by_session.insert(session_id, messages);
+        }
+        Ok(messages_by_session)
     }
 
     fn load_sqlite_messages_by_session(
@@ -606,7 +760,9 @@ impl OpenCodeConnector {
         // scan so old sessions' messages are never read or decoded (#372).
         let rows: Vec<SqliteMessageRow> = match keep_session_ids {
             None => conn.query_map_collect(
-                "SELECT session_id, id, data, time_created FROM message",
+                // `data IS NOT NULL`: internal marker rows carry no payload
+                // and would abort the whole collect (see the session query).
+                "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL",
                 params![],
                 |row| {
                     Ok(SqliteMessageRow {
@@ -623,24 +779,20 @@ impl OpenCodeConnector {
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT session_id, id, data, time_created FROM message WHERE session_id IN ({placeholders})"
+                        "SELECT session_id, id, data, time_created FROM message WHERE data IS NOT NULL AND session_id IS NOT NULL AND id IS NOT NULL AND session_id IN ({placeholders})"
                     );
-                    let bind: Vec<SqliteValue> = chunk
+                    let bind: Vec<ParamValue> = chunk
                         .iter()
-                        .map(|id| SqliteValue::Text((*id).clone()))
+                        .map(|id| ParamValue::from((*id).clone()))
                         .collect();
-                    rows.extend(conn.query_map_collect(
-                        &sql,
-                        params_from_iter(bind.iter()),
-                        |row| {
-                            Ok(SqliteMessageRow {
-                                session_id: row.get(0)?,
-                                id: row.get(1)?,
-                                data_json: row.get(2)?,
-                                time_created_raw: optional_sqlite_value(row, 3),
-                            })
-                        },
-                    )?);
+                    rows.extend(conn.query_map_collect(&sql, rusqlite::params_from_iter(&bind), |row| {
+                        Ok(SqliteMessageRow {
+                            session_id: row.get(0)?,
+                            id: row.get(1)?,
+                            data_json: row.get(2)?,
+                            time_created_raw: optional_sqlite_value(row, 3),
+                        })
+                    })?);
                 }
                 rows
             }
@@ -743,28 +895,26 @@ impl OpenCodeConnector {
         // scan only the kept messages' parts are read/decoded (#372: the `part`
         // table is the largest, so this is the dominant saving).
         let rows: Vec<(String, String)> = match message_ids {
-            None => {
-                conn.query_map_collect("SELECT message_id, data FROM part", params![], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
-                })?
-            }
+            None => conn.query_map_collect(
+                    "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL",
+                params![],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?,
             Some(ids) => {
                 let id_list: Vec<&String> = ids.iter().collect();
                 let mut rows: Vec<(String, String)> = Vec::new();
                 for chunk in id_list.chunks(OPENCODE_SQL_IN_CHUNK) {
                     let placeholders = vec!["?"; chunk.len()].join(",");
                     let sql = format!(
-                        "SELECT message_id, data FROM part WHERE message_id IN ({placeholders})"
+                        "SELECT message_id, data FROM part WHERE data IS NOT NULL AND message_id IS NOT NULL AND message_id IN ({placeholders})"
                     );
-                    let bind: Vec<SqliteValue> = chunk
+                    let bind: Vec<ParamValue> = chunk
                         .iter()
-                        .map(|id| SqliteValue::Text((*id).clone()))
+                        .map(|id| ParamValue::from((*id).clone()))
                         .collect();
-                    rows.extend(conn.query_map_collect(
-                        &sql,
-                        params_from_iter(bind.iter()),
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )?);
+                    rows.extend(conn.query_map_collect(&sql, rusqlite::params_from_iter(&bind), |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?);
                 }
                 rows
             }
@@ -812,6 +962,16 @@ struct PendingSqliteMessage {
     created_at: Option<i64>,
     message_id: String,
     message: NormalizedMessage,
+}
+
+/// One OpenCode 2.x `session_message` row (cass GH #504).
+struct SqliteV2MessageRow {
+    session_id: String,
+    id: String,
+    message_type: String,
+    seq: Option<i64>,
+    data_json: String,
+    time_created_raw: Option<SqliteValue>,
 }
 
 /// Session row from SQLite.
@@ -975,6 +1135,13 @@ impl Connector for OpenCodeConnector {
             db_candidates.retain(|p| seen.insert(p.clone()));
         }
 
+        // Session ids seen across ALL db candidates: stale migrated copies
+        // (e.g. ~/.config/opencode/opencode.db left behind after a move to
+        // ~/.local/share) share session ids with the live store, and
+        // emitting both double-indexes every conversation. First-wins by
+        // candidate priority order (explicit/data_dir before defaults).
+        let mut seen_db_session_ids: HashSet<String> = HashSet::new();
+
         for db in db_candidates {
             if !db.is_file() {
                 continue;
@@ -987,15 +1154,23 @@ impl Connector for OpenCodeConnector {
             }
             match Self::extract_from_sqlite(&db, ctx.since_ts, ctx.progress_tick.as_deref()) {
                 Ok(sqlite_convs) => {
+                    let fresh_count = sqlite_convs.len();
+                    convs.extend(sqlite_convs.into_iter().filter(|conv| {
+                        conv.external_id
+                            .as_ref()
+                            .is_none_or(|id| seen_db_session_ids.insert(id.clone()))
+                    }));
                     tracing::debug!(
-                        "opencode sqlite: found {} sessions in {}",
-                        sqlite_convs.len(),
+                        "opencode sqlite: found {fresh_count} sessions in {}",
                         db.display()
                     );
-                    convs.extend(sqlite_convs);
                 }
                 Err(e) => {
-                    tracing::debug!("opencode sqlite: failed to read {}: {e}", db.display());
+                    tracing::warn!(
+                        db = %db.display(),
+                        error = %e,
+                        "opencode sqlite: failed to read store; conversations from it may be missing"
+                    );
                 }
             }
         }
@@ -1167,7 +1342,124 @@ fn normalize_opencode_timestamp(ts: Option<i64>) -> Option<i64> {
     })
 }
 
-fn optional_sqlite_value(row: &Row<'_>, index: usize) -> Option<SqliteValue> {
+/// Whether `table` exists: `PRAGMA table_info` returns no rows for a missing table.
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let columns = conn
+        .query_map_collect(
+            &format!("PRAGMA table_info(\"{table}\")"),
+            params![],
+            |_row| Ok(()),
+        )
+        .with_context(|| format!("failed to check for OpenCode table {table}"))?;
+    Ok(!columns.is_empty())
+}
+
+/// Role, author and indexable text of one OpenCode 2.x `session_message` row,
+/// rendered like the 1.x parts. `data` is the message without its `type` and
+/// `id` (OpenCode's `SessionMessageData`). `None` for rows that carry no
+/// transcript text: `idle`, the `agent-`/`model-`/`location-switched` selection
+/// events, and compactions that did not complete.
+fn v2_message_content(
+    message_type: &str,
+    data: &serde_json::Value,
+) -> Option<(&'static str, Option<String>, String)> {
+    let field = |key: &str| {
+        data.get(key)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    let model = || {
+        data.pointer("/model/id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    match message_type {
+        // `synthetic` is model-facing text added on the user's side of the turn;
+        // 1.x kept the same text as synthetic text parts of the user message.
+        "user" | "synthetic" => Some(("user", Some("user".to_string()), field("text").to_string())),
+        "system" => Some(("system", None, field("text").to_string())),
+        "skill" => {
+            let text = field("text");
+            let content = if text.trim().is_empty() {
+                String::new()
+            } else {
+                format!("[Skill: {}]\n{text}", field("name"))
+            };
+            Some(("tool", None, content))
+        }
+        "shell" => {
+            let command = field("command");
+            let output = data
+                .pointer("/output/output")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let content = match (command.trim().is_empty(), output.trim().is_empty()) {
+                (true, true) => String::new(),
+                (_, true) => format!("$ {command}"),
+                _ => format!("$ {command}\n{output}"),
+            };
+            Some(("tool", None, content))
+        }
+        "assistant" => Some(("assistant", model(), assemble_v2_assistant_content(data))),
+        "compaction"
+            if data.get("status").and_then(serde_json::Value::as_str) == Some("completed") =>
+        {
+            let summary = field("summary");
+            let content = if summary.trim().is_empty() {
+                String::new()
+            } else {
+                format!("[Compaction Summary]\n{summary}")
+            };
+            Some(("assistant", model(), content))
+        }
+        _ => None,
+    }
+}
+
+/// An OpenCode 2.x assistant message's `content` items rendered like the 1.x
+/// parts: text as-is, reasoning as `[Reasoning]`, and a tool call's text
+/// results as `[Tool Output]` (file results carry no text).
+fn assemble_v2_assistant_content(data: &serde_json::Value) -> String {
+    let mut pieces: Vec<String> = Vec::new();
+    let items = data
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    for item in items {
+        let text = item
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        match item.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") if !text.trim().is_empty() => pieces.push(text.to_string()),
+            Some("reasoning") if !text.trim().is_empty() => {
+                pieces.push(format!("[Reasoning]\n{text}"));
+            }
+            Some("tool") => {
+                let output: Vec<&str> = item
+                    .pointer("/state/content")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|result| {
+                        result.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
+                    .filter_map(|result| result.get("text").and_then(serde_json::Value::as_str))
+                    .collect();
+                let output = output.join("\n");
+                if !output.trim().is_empty() {
+                    pieces.push(format!("[Tool Output]\n{output}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    pieces.join("\n\n")
+}
+
+fn optional_sqlite_value(row: &Row, index: usize) -> Option<SqliteValue> {
     row.get::<_, SqliteValue>(index)
         .ok()
         .filter(|value| !matches!(value, SqliteValue::Null))
@@ -1280,9 +1572,25 @@ fn session_has_updates(
 
 /// Parse a session JSON file
 fn parse_session_file(path: &Path) -> Result<SessionInfo> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("read session file {}", path.display()))?;
-    let session: SessionInfo = serde_json::from_str(&content)
+    let content = match read_capped(path) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Err(anyhow::Error::msg(format!(
+                "session file {} exceeds the scan size cap",
+                path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(
+                anyhow::Error::new(e).context(format!("read session file {}", path.display()))
+            );
+        }
+    };
+    // Editors/tools sometimes leave a UTF-8 BOM on flat-file sessions;
+    // serde_json rejects a leading U+FEFF and the whole session would be
+    // silently skipped (gemini's replay strips it for the same reason).
+    let content = content.trim_start_matches('\u{feff}');
+    let session: SessionInfo = serde_json::from_str(content)
         .with_context(|| format!("parse session JSON {}", path.display()))?;
     Ok(session)
 }
@@ -1307,8 +1615,17 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
         .collect();
 
     for msg_file in msg_files {
-        let content = match fs::read_to_string(&msg_file) {
-            Ok(c) => c,
+        // Cap the read (message JSONs embed full tool outputs) and strip a
+        // leading UTF-8 BOM, which serde_json rejects (same as session files).
+        let content = match read_capped(&msg_file) {
+            Ok(Some(c)) => c.trim_start_matches('\u{feff}').to_string(),
+            Ok(None) => {
+                tracing::debug!(
+                    file = %msg_file.display(),
+                    "opencode: message file exceeds the scan size cap; skipping"
+                );
+                continue;
+            }
             Err(_) => continue,
         };
 
@@ -1332,7 +1649,10 @@ fn load_messages(session_msg_dir: &Path, part_dir: &Path) -> Result<Vec<Normaliz
                 }
                 let path = entry.path();
                 if path.extension().map(|e| e == "json").unwrap_or(false)
-                    && let Ok(content) = fs::read_to_string(path)
+                    && let Some(content) = read_capped(path)
+                        .ok()
+                        .flatten()
+                        .map(|c| c.trim_start_matches('\u{feff}').to_string())
                     && let Ok(part) = serde_json::from_str::<PartInfo>(&content)
                 {
                     parts.push(part);
@@ -1904,7 +2224,11 @@ mod tests {
         write_part(&storage, "msg-001", &part);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2020,7 +2344,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2036,7 +2364,11 @@ mod tests {
         let storage = create_opencode_storage(&dir);
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2056,7 +2388,11 @@ mod tests {
         // Don't create any messages
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2093,7 +2429,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].title, Some("This is the first line".to_string()));
@@ -2124,7 +2464,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].agent_slug, "opencode");
@@ -2155,7 +2499,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].metadata["session_id"], "sess-meta");
@@ -2201,7 +2549,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages.len(), 2);
@@ -2242,7 +2594,11 @@ mod tests {
         }
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].messages[0].idx, 0);
@@ -2271,7 +2627,11 @@ mod tests {
         // Don't create any parts
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         // Session should be skipped because message has no content
@@ -2306,7 +2666,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         // Should only have one conversation (deduplicated)
@@ -2338,7 +2702,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         // Default role should be "assistant"
@@ -2382,7 +2750,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         let content = &convs[0].messages[0].content;
@@ -2420,7 +2792,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs[0].started_at, Some(1_733_000_000_000));
@@ -2453,7 +2829,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(
@@ -2473,7 +2853,11 @@ mod tests {
         fs::write(session_dir.join("invalid.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 0);
@@ -2496,7 +2880,11 @@ mod tests {
         fs::write(msg_dir.join("bad.json"), "not valid json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         // Should skip the session because no valid messages
@@ -2557,7 +2945,11 @@ mod tests {
         fs::write(session_dir.join("sess-empty.json"), "").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2571,7 +2963,11 @@ mod tests {
         fs::write(session_dir.join("sess-ws.json"), "   \n\t  ").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2589,7 +2985,11 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2607,7 +3007,11 @@ mod tests {
         .unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 0);
     }
@@ -2624,7 +3028,11 @@ mod tests {
         std::fs::write(session_dir.join("sess-bom.json"), &data).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         // BOM may cause parse failure; connector should skip gracefully
         let convs = connector.scan(&ctx).unwrap();
         assert!(convs.len() <= 1);
@@ -2640,7 +3048,11 @@ mod tests {
         fs::write(session_dir.join("sess-bad.json"), r#"{"id": 12345}"#).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         // Should skip since id is not a string (serde will fail)
         assert_eq!(convs.len(), 0);
@@ -2679,7 +3091,11 @@ mod tests {
         fs::write(part_dir.join("p-deep.json"), &nested).unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         // Should not stack overflow
         let result = connector.scan(&ctx);
         assert!(result.is_ok());
@@ -2709,7 +3125,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.len() >= 1_000_000);
@@ -2738,7 +3158,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert!(convs[0].messages[0].content.contains("hello"));
@@ -2768,7 +3192,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         // Message with only whitespace content should be skipped
         assert_eq!(convs.len(), 0);
@@ -2803,7 +3231,11 @@ mod tests {
         fs::write(msg_dir.join("msg-corrupt.json"), "{{{{not json").unwrap();
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         // Valid message should still be parsed; corrupted one skipped
         assert_eq!(convs.len(), 1);
@@ -2829,7 +3261,11 @@ mod tests {
         // Don't create part directory at all (not even the part/msg-nopartdir/ dir)
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         // Message without parts should be skipped (empty content)
         assert_eq!(convs.len(), 0);
@@ -2859,7 +3295,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         // Part without type is ignored, message has no content, so session skipped
         assert_eq!(convs.len(), 0);
@@ -2899,7 +3339,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         let content = &convs[0].messages[0].content;
@@ -2948,7 +3392,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -2984,7 +3432,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
 
         assert_eq!(convs.len(), 1);
@@ -3015,7 +3467,11 @@ mod tests {
         );
 
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(storage.clone(), None);
+        let ctx = ScanContext::with_roots(
+            storage.clone(),
+            vec![ScanRoot::local(storage.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         // Timestamps should be None
@@ -3192,7 +3648,8 @@ mod tests {
             full_ids,
             ["old", "new", "null-recent", "null-old"]
                 .iter()
-                .map(|s| s.to_string())
+                .copied()
+                .map(str::to_string)
                 .collect()
         );
 
@@ -3204,7 +3661,8 @@ mod tests {
             inc_ids,
             ["new", "null-recent"]
                 .iter()
-                .map(|s| s.to_string())
+                .copied()
+                .map(str::to_string)
                 .collect(),
             "incremental keeps updated>=cutoff and unknown-time+recent-msg, drops the rest"
         );
@@ -3740,7 +4198,11 @@ mod tests {
 
         // Pass the parent directory (not the .db file itself).
         let connector = OpenCodeConnector::new();
-        let ctx = ScanContext::local_default(dir.path().to_path_buf(), None);
+        let ctx = ScanContext::with_roots(
+            dir.path().to_path_buf(),
+            vec![ScanRoot::local(dir.path().to_path_buf())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-parent"));
@@ -3896,7 +4358,11 @@ mod tests {
 
         let connector = OpenCodeConnector::new();
         // Pass the db file itself as data_dir.
-        let ctx = ScanContext::local_default(db_path.clone(), None);
+        let ctx = ScanContext::with_roots(
+            db_path.clone(),
+            vec![ScanRoot::local(db_path.clone())],
+            None,
+        );
         let convs = connector.scan(&ctx).unwrap();
         assert_eq!(convs.len(), 1);
         assert_eq!(convs[0].external_id.as_deref(), Some("sess-direct"));
@@ -4015,14 +4481,14 @@ mod tests {
     /// roots, i.e. default detection) must keep the issue #174 home/XDG DB
     /// fallback, and any remote root in the mix disables it.
     #[test]
-    fn local_scan_roots_keep_default_db_fallback() {
+    fn explicit_scan_roots_disable_default_db_fallback() {
         let dir = TempDir::new().unwrap();
         let local_ctx = ScanContext::with_roots(
             PathBuf::new(),
             vec![ScanRoot::local(dir.path().to_path_buf())],
             None,
         );
-        assert!(OpenCodeConnector::allow_local_default_dbs(&local_ctx));
+        assert!(!OpenCodeConnector::allow_local_default_dbs(&local_ctx));
 
         let default_ctx = ScanContext::local_default(PathBuf::new(), None);
         assert!(OpenCodeConnector::allow_local_default_dbs(&default_ctx));
@@ -4043,5 +4509,421 @@ mod tests {
             !OpenCodeConnector::allow_local_default_dbs(&mixed_ctx),
             "any remote root disables the local-default fallback"
         );
+    }
+
+    // =====================================================
+    // OpenCode 2.x session_v2 / session_message (cass GH #504)
+    // =====================================================
+
+    /// Adds OpenCode 2.x tables (columns as in OpenCode v2.0.16's
+    /// packages/core/src/session/sql.ts) to a test db.
+    fn add_opencode_v2_tables(db_path: &Path, with_session_v2: bool) {
+        let conn = open_test_connection(db_path);
+        if with_session_v2 {
+            conn.execute_batch(
+                "CREATE TABLE session_v2 (
+                    id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    parent_id TEXT,
+                    slug TEXT NOT NULL,
+                    directory TEXT NOT NULL,
+                    title TEXT,
+                    version TEXT NOT NULL,
+                    time_created INTEGER NOT NULL,
+                    time_updated INTEGER NOT NULL,
+                    time_archived INTEGER
+                );",
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    fn insert_v2_session(conn: &Connection, id: &str, title: &str, updated_ms: i64) {
+        conn.execute_compat(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?1, 'proj-2', ?2, '/work/v2', ?3, '2.0.16', ?4, ?5)",
+            params![id, format!("slug-{id}"), title, updated_ms, updated_ms],
+        )
+        .unwrap();
+    }
+
+    fn insert_v2_message(conn: &Connection, session_id: &str, seq: i64, kind: &str, data: &str) {
+        conn.execute_compat(
+            "INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                format!("msg_{session_id}_{seq}"),
+                session_id,
+                kind,
+                seq,
+                1_700_000_000_000_i64 + seq * 1_000,
+                1_700_000_000_000_i64 + seq * 1_000,
+                data
+            ],
+        )
+        .unwrap();
+    }
+
+    fn insert_v1_text_message(
+        conn: &Connection,
+        session_id: &str,
+        id: &str,
+        role: &str,
+        text: &str,
+    ) {
+        conn.execute_compat(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            params![
+                id,
+                session_id,
+                format!(r#"{{"role":"{role}","time":{{"created":1600000000000}}}}"#),
+            ],
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO part (id, message_id, session_id, data) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                format!("part-{id}"),
+                id,
+                session_id,
+                serde_json::json!({"type": "text", "text": text}).to_string(),
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sqlite_v2_session_only_in_session_v2_is_indexed_in_seq_order() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_v2only", "Created on 2.x", 1_700_000_100_000);
+        // seq, not insertion order or timestamps, is the transcript order.
+        insert_v2_message(
+            &conn,
+            "ses_v2only",
+            2,
+            "assistant",
+            r#"{"agent":"build","model":{"id":"gpt-5","providerID":"openai"},"time":{"created":1700000002000},
+                "content":[
+                  {"type":"reasoning","text":"think first"},
+                  {"type":"text","text":"the answer"},
+                  {"type":"tool","id":"call_1","name":"read","state":{"status":"completed","input":{"path":"a.rs"},
+                   "content":[{"type":"text","text":"tool result line"},{"type":"file","uri":"file:///a.png","mime":"image/png"}]},
+                   "time":{"created":1700000002000}}]}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_v2only",
+            1,
+            "user",
+            r#"{"text":"find the v2only phrase","time":{"created":1700000001000}}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_v2only",
+            0,
+            "agent-switched",
+            r#"{"agent":"build","time":{"created":1700000000000}}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_v2only",
+            3,
+            "idle",
+            r#"{"outcome":"succeeded","time":{"created":1700000003000}}"#,
+        );
+        drop(conn);
+
+        let extracted = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(extracted.len(), 1);
+        let session = &extracted[0];
+        assert_eq!(session.external_id.as_deref(), Some("ses_v2only"));
+        assert_eq!(session.title.as_deref(), Some("Created on 2.x"));
+        assert_eq!(session.workspace, Some(PathBuf::from("/work/v2")));
+        assert_eq!(session.metadata["opencode_schema"], "v2");
+        assert_eq!(
+            session.messages.len(),
+            2,
+            "idle and agent-switched rows carry no text"
+        );
+        assert_eq!(session.messages[0].role, "user");
+        assert_eq!(session.messages[0].content, "find the v2only phrase");
+        assert_eq!(session.messages[0].created_at, Some(1_700_000_001_000));
+        assert_eq!(session.messages[1].role, "assistant");
+        assert_eq!(session.messages[1].author.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            session.messages[1].content,
+            "[Reasoning]\nthink first\n\nthe answer\n\n[Tool Output]\ntool result line"
+        );
+        assert_eq!(session.messages[1].extra["seq"], 2);
+        assert_eq!(session.messages[1].extra["type"], "assistant");
+        assert_eq!(
+            (session.messages[0].idx, session.messages[1].idx),
+            (0, 1),
+            "messages are reindexed in seq order"
+        );
+    }
+
+    #[test]
+    fn sqlite_v2_migrated_session_is_indexed_once_from_its_v2_transcript() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        // A 1.x session migrated to 2.x keeps the same id in both schemas.
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_migrated", "proj-1", "Old 1.x title", "/work/v1"],
+        )
+        .unwrap();
+        insert_v1_text_message(&conn, "ses_migrated", "msg-old", "user", "the v1 copy");
+        insert_v2_session(&conn, "ses_migrated", "2.x title", 1_700_000_100_000);
+        insert_v2_message(
+            &conn,
+            "ses_migrated",
+            1,
+            "user",
+            r#"{"text":"the v2 copy"}"#,
+        );
+        // A session that only exists in 1.x is still read from 1.x.
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_v1only", "proj-1", "Only 1.x", "/work/v1"],
+        )
+        .unwrap();
+        insert_v1_text_message(&conn, "ses_v1only", "msg-v1", "user", "a 1.x prompt");
+        drop(conn);
+
+        let mut convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        convs.sort_by(|a, b| a.external_id.cmp(&b.external_id));
+        assert_eq!(convs.len(), 2, "the migrated session is indexed once");
+        let migrated = &convs[0];
+        assert_eq!(migrated.external_id.as_deref(), Some("ses_migrated"));
+        assert_eq!(migrated.title.as_deref(), Some("2.x title"));
+        assert_eq!(migrated.metadata["opencode_schema"], "v2");
+        let contents: Vec<&str> = migrated
+            .messages
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(contents, vec!["the v2 copy"]);
+        let v1_only = &convs[1];
+        assert_eq!(v1_only.external_id.as_deref(), Some("ses_v1only"));
+        assert_eq!(v1_only.metadata["opencode_schema"], "v1");
+        assert_eq!(v1_only.messages[0].content, "a 1.x prompt");
+    }
+
+    #[test]
+    fn sqlite_v2_rows_without_text_neither_create_messages_nor_hide_the_v1_transcript() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        // 2.x-only session whose rows are all non-transcript events.
+        insert_v2_session(&conn, "ses_events", "Events only", 1_700_000_100_000);
+        insert_v2_message(
+            &conn,
+            "ses_events",
+            1,
+            "model-switched",
+            r#"{"model":{"id":"m","providerID":"p"}}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_events",
+            2,
+            "compaction",
+            r#"{"status":"running","reason":"auto","summary":"partial","recent":""}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_events",
+            3,
+            "idle",
+            r#"{"outcome":"interrupted"}"#,
+        );
+        insert_v2_message(
+            &conn,
+            "ses_events",
+            4,
+            "assistant",
+            r#"{"content":[{"type":"text","text":"   "}]}"#,
+        );
+        // Migrated session whose 2.x rows carry no text: its 1.x transcript is kept.
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, title, directory) VALUES (?1, ?2, ?3, ?4)",
+            params!["ses_fallback", "proj-1", "Fallback", "/work/v1"],
+        )
+        .unwrap();
+        insert_v1_text_message(&conn, "ses_fallback", "msg-fb", "user", "kept from 1.x");
+        insert_v2_session(&conn, "ses_fallback", "Fallback", 1_700_000_100_000);
+        insert_v2_message(
+            &conn,
+            "ses_fallback",
+            1,
+            "idle",
+            r#"{"outcome":"succeeded"}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1, "a session with no text rows is not indexed");
+        assert_eq!(convs[0].external_id.as_deref(), Some("ses_fallback"));
+        assert_eq!(convs[0].metadata["opencode_schema"], "v1");
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "kept from 1.x");
+    }
+
+    #[test]
+    fn sqlite_v2_malformed_row_is_skipped_without_dropping_the_session() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_bad_row", "One bad row", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_bad_row", 1, "user", "{not json");
+        insert_v2_message(
+            &conn,
+            "ses_bad_row",
+            2,
+            "user",
+            r#"{"text":"still indexed"}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].messages.len(), 1);
+        assert_eq!(convs[0].messages[0].content, "still indexed");
+    }
+
+    #[test]
+    fn sqlite_v2_transcripts_are_read_for_session_rows_without_session_v2_or_1x_tables() {
+        // Later 2.x builds keep 2.x sessions in `session` itself; a fresh store
+        // need not have the 1.x `message`/`part` tables at all.
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = open_test_connection(&db_path);
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute_compat(
+            "INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES ('ses_dev', 'proj-3', 'dev', '/work/dev', 'Dev layout', '2.1.0', 1700000000000, 1700000000000)",
+            params![],
+        )
+        .unwrap();
+        drop(conn);
+        add_opencode_v2_tables(&db_path, false);
+        let conn = open_test_connection(&db_path);
+        insert_v2_message(
+            &conn,
+            "ses_dev",
+            1,
+            "user",
+            r#"{"text":"dev layout prompt"}"#,
+        );
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, None, None).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].external_id.as_deref(), Some("ses_dev"));
+        assert_eq!(convs[0].messages[0].content, "dev layout prompt");
+    }
+
+    #[test]
+    fn sqlite_v2_incremental_scan_skips_old_v2_sessions() {
+        let dir = TempDir::new().unwrap();
+        let db_path = create_test_sqlite_db(dir.path());
+        add_opencode_v2_tables(&db_path, true);
+        let conn = open_test_connection(&db_path);
+        insert_v2_session(&conn, "ses_old", "Old", 1_600_000_000_000);
+        insert_v2_message(&conn, "ses_old", 1, "user", r#"{"text":"old prompt"}"#);
+        insert_v2_session(&conn, "ses_new", "New", 1_700_000_100_000);
+        insert_v2_message(&conn, "ses_new", 1, "user", r#"{"text":"new prompt"}"#);
+        drop(conn);
+
+        let convs = OpenCodeConnector::extract_from_sqlite(&db_path, Some(1_700_000_000_000), None)
+            .unwrap();
+        let ids: Vec<Option<&str>> = convs.iter().map(|c| c.external_id.as_deref()).collect();
+        assert_eq!(ids, vec![Some("ses_new")]);
+    }
+
+    #[test]
+    fn v2_message_content_renders_every_text_bearing_type() {
+        let render = |kind: &str, data: serde_json::Value| v2_message_content(kind, &data);
+        assert_eq!(
+            render(
+                "shell",
+                json!({"command": "cargo test", "status": "exited",
+                "output": {"output": "ok. 3 passed", "cursor": 12, "size": 12, "truncated": false}})
+            ),
+            Some(("tool", None, "$ cargo test\nok. 3 passed".to_string()))
+        );
+        assert_eq!(
+            render(
+                "skill",
+                json!({"skill": "sk_1", "name": "review", "text": "Check each hunk."})
+            ),
+            Some((
+                "tool",
+                None,
+                "[Skill: review]\nCheck each hunk.".to_string()
+            ))
+        );
+        assert_eq!(
+            render("system", json!({"text": "Working directory changed."})),
+            Some(("system", None, "Working directory changed.".to_string()))
+        );
+        assert_eq!(
+            render("synthetic", json!({"text": "Attached file contents"})),
+            Some((
+                "user",
+                Some("user".to_string()),
+                "Attached file contents".to_string()
+            ))
+        );
+        assert_eq!(
+            render(
+                "compaction",
+                json!({"status": "completed", "reason": "auto",
+                "model": {"id": "gpt-5", "providerID": "openai"}, "summary": "Earlier work", "recent": ""})
+            ),
+            Some((
+                "assistant",
+                Some("gpt-5".to_string()),
+                "[Compaction Summary]\nEarlier work".to_string()
+            ))
+        );
+        assert_eq!(
+            render("compaction", json!({"status": "failed", "reason": "auto"})),
+            None
+        );
+        assert_eq!(render("location-switched", json!({"location": {}})), None);
+        assert_eq!(render("idle", json!({"outcome": "succeeded"})), None);
     }
 }

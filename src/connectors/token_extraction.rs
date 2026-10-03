@@ -10,6 +10,10 @@ pub enum TokenDataSource {
     /// Estimated from content character count (~4 chars per token).
     #[default]
     Estimated,
+    /// Deliberately no usage and no estimate (e.g. Shelley fork-copied rows
+    /// whose original usage is already counted once). Consumers must exclude
+    /// these from both API totals and estimated totals.
+    Suppressed,
 }
 
 impl TokenDataSource {
@@ -18,6 +22,7 @@ impl TokenDataSource {
         match self {
             Self::Api => "api",
             Self::Estimated => "estimated",
+            Self::Suppressed => "suppressed",
         }
     }
 }
@@ -260,12 +265,17 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
         && let Some(payload) = extra.get("payload")
         && payload.get("type").and_then(|v| v.as_str()) == Some("token_count")
     {
-        input_tokens = payload.get("input_tokens").and_then(Value::as_i64);
-        output_tokens = payload
+        // Real rollouts nest per-turn usage at info.last_token_usage
+        // (info.total_token_usage is cumulative — never attach it).
+        let usage_block = payload.pointer("/info/last_token_usage").unwrap_or(payload);
+        input_tokens = usage_block.get("input_tokens").and_then(Value::as_i64);
+        output_tokens = usage_block
             .get("output_tokens")
             .and_then(Value::as_i64)
-            .or_else(|| payload.get("tokens").and_then(Value::as_i64));
-        data_source = TokenDataSource::Api;
+            .or_else(|| usage_block.get("tokens").and_then(Value::as_i64));
+        if input_tokens.is_some() || output_tokens.is_some() {
+            data_source = TokenDataSource::Api;
+        }
     }
 
     let model_name = extra
@@ -289,12 +299,7 @@ pub fn extract_codex_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
-/// Extract token usage from one Miniharness message's raw data.
-///
-/// Miniharness uses the compact field names `input`, `output`, `cacheRead`,
-/// `cacheWrite`, and `reasoning`. The complete source record remains in the
-/// normalized message's `extra`; this helper only exposes the existing
-/// per-message token shape and never aggregates a session.
+/// Extract per-message Miniharness usage without selecting session accounting policy.
 #[must_use]
 pub fn extract_miniharness_tokens(extra: &Value) -> ExtractedTokenUsage {
     let message = extra.pointer("/message").unwrap_or(extra);
@@ -365,6 +370,7 @@ pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedToken
 
 /// Extract token usage from a message, dispatching by agent type.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn extract_tokens_for_agent(
     agent_slug: &str,
     extra: &Value,
@@ -375,6 +381,110 @@ pub fn extract_tokens_for_agent(
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
         "miniharness" => extract_miniharness_tokens(extra),
+        // Prime Agent assistant messages carry a full usage block
+        // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
+        // preserves under `extra.usage`. Child-usage attribution entries are
+        // deliberately NOT summed here: Prime folds them into the parent
+        // assistant aggregate on reload, so counting them again would double
+        // count.
+        "prime_agent" => {
+            let model_name = extra
+                .get("model")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let provider = extra
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+                .or_else(|| {
+                    model_name
+                        .as_deref()
+                        .map(|name| normalize_model(name).provider)
+                });
+            let usage = extra.get("usage");
+            let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+            let input_tokens = read("input");
+            let output_tokens = read("output");
+            let cache_read_tokens = read("cacheRead");
+            let cache_creation_tokens = read("cacheWrite");
+            let has_api_data = input_tokens.is_some() || output_tokens.is_some();
+            ExtractedTokenUsage {
+                model_name,
+                provider,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+                data_source: if has_api_data {
+                    TokenDataSource::Api
+                } else {
+                    TokenDataSource::Estimated
+                },
+                ..Default::default()
+            }
+        }
+        // Shelley: the connector preserves direct llm.Usage under
+        // `extra.usage` (snake_case fields) and marks fork-copied rows with
+        // `extra.fork_copied` so their already-counted usage is neither
+        // re-counted nor re-estimated. Indirect `other_usage` entries are
+        // deliberately NOT summed here: they are heterogeneous purposed calls
+        // preserved as metadata only.
+        "shelley" => {
+            if extra
+                .get("fork_copied")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                ExtractedTokenUsage {
+                    data_source: TokenDataSource::Suppressed,
+                    ..Default::default()
+                }
+            } else {
+                let usage = extra.get("usage");
+                let read = |key: &str| usage.and_then(|u| u.get(key)).and_then(Value::as_i64);
+                let model_name = extra
+                    .get("model_name")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+                    .or_else(|| {
+                        usage
+                            .and_then(|u| u.get("model"))
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    });
+                let provider = model_name
+                    .as_deref()
+                    .map(|name| normalize_model(name).provider);
+                let input_tokens = read("input_tokens");
+                let output_tokens = read("output_tokens");
+                let cache_read_tokens = read("cache_read_input_tokens");
+                let cache_creation_tokens = read("cache_creation_input_tokens");
+                let tool_call_count = u32::try_from(
+                    extra
+                        .pointer("/cass/tool_call_count")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0),
+                )
+                .unwrap_or(u32::MAX);
+                let has_api = input_tokens.is_some() || output_tokens.is_some();
+                ExtractedTokenUsage {
+                    model_name,
+                    provider,
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    has_tool_calls: tool_call_count > 0,
+                    tool_call_count,
+                    data_source: if has_api {
+                        TokenDataSource::Api
+                    } else {
+                        TokenDataSource::Estimated
+                    },
+                    ..Default::default()
+                }
+            }
+        }
         "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
             let model_name = extra
                 .get("model")
@@ -397,9 +507,13 @@ pub fn extract_tokens_for_agent(
         _ => ExtractedTokenUsage::default(),
     };
 
-    // Reasoning is a meaningful native sub-count even when a provider omits
-    // input/output. Do not replace that evidence with a content estimate.
-    if !extracted.has_token_data() && extracted.thinking_tokens.is_none() && !content.is_empty() {
+    if matches!(extracted.data_source, TokenDataSource::Suppressed) {
+        // Explicit suppressed state: no API data AND no content-based
+        // estimation fallback.
+        return extracted;
+    }
+
+    if !extracted.has_token_data() && !content.is_empty() {
         let mut estimated = estimate_tokens_from_content(content, role);
         estimated.model_name = extracted.model_name;
         estimated.provider = extracted.provider;
@@ -615,39 +729,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_miniharness_tokens_from_nested_message() {
-        let raw: Value = serde_json::json!({
-            "kind": "entry",
-            "type": "message",
-            "message": {
-                "role": "assistant",
-                "provider": "commandcode",
-                "model": "deepseek/deepseek-v4-flash",
-                "usage": {
-                    "input": 100,
-                    "output": 20,
-                    "cacheRead": 30,
-                    "cacheWrite": 4,
-                    "reasoning": 5
-                }
-            }
-        });
-
-        let usage = extract_tokens_for_agent("miniharness", &raw, "done", "assistant");
-        assert_eq!(
-            usage.model_name.as_deref(),
-            Some("deepseek/deepseek-v4-flash")
-        );
-        assert_eq!(usage.provider.as_deref(), Some("commandcode"));
-        assert_eq!(usage.input_tokens, Some(100));
-        assert_eq!(usage.output_tokens, Some(20));
-        assert_eq!(usage.cache_read_tokens, Some(30));
-        assert_eq!(usage.cache_creation_tokens, Some(4));
-        assert_eq!(usage.thinking_tokens, Some(5));
-        assert_eq!(usage.data_source, TokenDataSource::Api);
-    }
-
-    #[test]
     fn estimate_tokens_user_message() {
         let usage = estimate_tokens_from_content("Hello, this is a test message!", "user");
         assert!(usage.input_tokens.unwrap() > 0);
@@ -688,5 +769,37 @@ mod tests {
         let usage = extract_tokens_for_agent("aider", &raw, "Some content here", "assistant");
         assert_eq!(usage.data_source, TokenDataSource::Estimated);
         assert!(usage.output_tokens.unwrap() > 0);
+    }
+    #[test]
+    fn extract_miniharness_tokens_from_nested_message() {
+        let raw: Value = serde_json::json!({
+            "kind": "entry",
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "provider": "commandcode",
+                "model": "deepseek/deepseek-v4-flash",
+                "usage": {
+                    "input": 100,
+                    "output": 20,
+                    "cacheRead": 30,
+                    "cacheWrite": 4,
+                    "reasoning": 5
+                }
+            }
+        });
+
+        let usage = extract_tokens_for_agent("miniharness", &raw, "done", "assistant");
+        assert_eq!(
+            usage.model_name.as_deref(),
+            Some("deepseek/deepseek-v4-flash")
+        );
+        assert_eq!(usage.provider.as_deref(), Some("commandcode"));
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(30));
+        assert_eq!(usage.cache_creation_tokens, Some(4));
+        assert_eq!(usage.thinking_tokens, Some(5));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
     }
 }

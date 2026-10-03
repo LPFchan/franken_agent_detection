@@ -268,6 +268,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn source_line(message: Value, timestamp: i64) -> String {
         json!({
             "kind": "entry",
@@ -322,7 +323,7 @@ mod tests {
                         "cacheRead": 30,
                         "cacheWrite": 4,
                         "reasoning": 5,
-                        "cost": {"total": 0.012345},
+                        "cost": {"total": 0.012_345},
                     },
                 }),
                 1_700_000_000_200,
@@ -341,7 +342,7 @@ mod tests {
                 .extra
                 .pointer("/message/usage/cost/total")
                 .and_then(Value::as_f64),
-            Some(0.012345)
+            Some(0.012_345)
         );
         assert_eq!(
             conversation.messages[1]

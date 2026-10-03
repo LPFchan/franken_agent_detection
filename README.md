@@ -25,9 +25,10 @@ evidence in normalized message payloads without imposing consumer-side
 accounting or visibility policy. Muse's observed schema is documented in
 [upstream issue #15](https://github.com/Dicklesworthstone/franken_agent_detection/issues/15).
 
-The crates.io commands below describe the upstream package. Muse and
-Miniharness support in this LPFchan fork requires the git dependency shown in
-the installation section.
+The crates.io commands below describe the upstream package. Miniharness support
+in this LPFchan fork requires the git dependency shown in the installation
+section. Muse and native VS Code Copilot parsing use upstream implementations.
+Enable `copilot-vscdb` to include historical VS Code SQLite transcripts.
 
 ## What this crate does
 
@@ -102,7 +103,7 @@ cargo add franken-agent-detection
 
 ```toml
 [dependencies]
-franken-agent-detection = "0.1.7"
+franken-agent-detection = "0.3.0"
 ```
 
 ### LPFchan fork with Muse support
@@ -175,7 +176,7 @@ detect_installed_agents(opts)
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `gemini`, etc.) |
+| `UnknownConnectors` error | Connector slug not recognized | Use known slugs (`codex`, `claude`, `omp`, `gemini`, etc.) |
 | Empty results | No roots exist on this machine | Set `include_undetected = true` to inspect evidence |
 | Non-deterministic tests | Real home-dir probing in tests | Use `root_overrides` with temp directories |
 | Missing connector in report | Scoped connectors exclude it | Remove or expand `only_connectors` |

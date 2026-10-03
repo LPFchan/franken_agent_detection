@@ -5,7 +5,7 @@
 - Upstream: https://github.com/Dicklesworthstone/franken_agent_detection
 - Project id: `franken-agent-detection`
 - Operator: LPFchan (GitHub: `LPFchan`)
-- Last updated: 2026-08-15
+- Last updated: 2026-10-04
 
 ## Project thesis
 
@@ -35,6 +35,7 @@ that upstream has not accepted yet.
 ## Invariants
 
 - Connector discovery and scanning cover the same source files.
+- Explicit scan roots bound source discovery rather than admitting unrelated local databases.
 - Provider sequence fields are authoritative when a provider documents them.
 - Unsupported or ambiguous provider data remains raw evidence rather than being
   assigned invented semantics.
