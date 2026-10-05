@@ -1,3 +1,4 @@
+<!-- template-managed:begin -->
 # Agent Instructions
 
 `AGENTS.md` is the canonical editable agent-instructions file. It enforces repo behavior while deferring canonical policy to `records/REPO.md`.
@@ -43,3 +44,9 @@ Repo-agnostic skills (`sharpen-the-tip`, `prototype-mode`, `housekeeping`, `proa
 - Do not turn an inbox review into a digest of every low-confidence idea. Report counts or clusters.
 - Do not write chatty transcripts where the repo expects normalized records.
 - Do not bypass commit provenance checks unless the commit is an explicit bootstrap or migration exception.
+<!-- template-managed:end -->
+
+## Repo-Specific Rules
+
+The managed section above is updated by `scripts/sync-from-template.sh`.
+Keep repo-specific instructions below the end marker; sync preserves this tail.
