@@ -337,6 +337,14 @@ impl ClaudeCodeConnector {
             cass.insert("model".to_string(), Value::String(model.to_string()));
         }
 
+        // Claude Code writes one line per content block of a reply, each
+        // repeating the reply's usage; embedders dedupe token totals on these.
+        for (key, pointer) in [("message_id", "/message/id"), ("request_id", "/requestId")] {
+            if let Some(value) = raw.pointer(pointer).and_then(Value::as_str) {
+                cass.insert(key.to_string(), Value::String(value.to_string()));
+            }
+        }
+
         let usage = raw.pointer("/message/usage");
         let mut token_usage = serde_json::Map::new();
         if let Some(input_tokens) = usage
@@ -1511,7 +1519,9 @@ mod tests {
     #[test]
     fn compact_message_extra_keeps_only_compact_cass_metadata() {
         let raw = json!({
+            "requestId": "req_1",
             "message": {
+                "id": "msg_1",
                 "model": "claude-opus-4-6",
                 "usage": {
                     "input_tokens": 100,
@@ -1532,6 +1542,8 @@ mod tests {
 
         let compact = ClaudeCodeConnector::compact_message_extra(&raw);
         assert_eq!(compact["cass"]["model"], "claude-opus-4-6");
+        assert_eq!(compact["cass"]["message_id"], "msg_1");
+        assert_eq!(compact["cass"]["request_id"], "req_1");
         assert_eq!(compact["cass"]["token_usage"]["input_tokens"], 100);
         assert_eq!(compact["cass"]["token_usage"]["output_tokens"], 50);
         assert_eq!(compact["cass"]["token_usage"]["cache_read_tokens"], 20);
