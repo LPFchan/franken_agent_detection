@@ -692,8 +692,10 @@ fn read_kimi_code_state(session_root: &Path) -> KimiCodeState {
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .map(String::from),
+        // Kimi Code wrote `workDir`; `version: 2` state files write `cwd`.
         workspace: val
             .get("workDir")
+            .or_else(|| val.get("cwd"))
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
             .map(PathBuf::from),
@@ -1775,6 +1777,30 @@ mod tests {
         );
         assert_eq!(convs[0].messages[2].role, "assistant");
         assert!(convs[0].messages[2].author.is_none());
+    }
+
+    #[test]
+    fn modern_state_v2_reads_workspace_from_cwd() {
+        let dir = TempDir::new().unwrap();
+        let storage = create_kimi_code_storage(&dir);
+
+        let lines = vec![
+            r#"{"type":"turn.prompt","input":[{"type":"text","text":"Hello"}],"time":"2026-01-01T00:00:00Z"}"#,
+        ];
+        write_modern_wire_file(&storage, "wdk-1", "sess-v2", "main", &lines);
+        write_modern_state(
+            &storage,
+            "wdk-1",
+            "sess-v2",
+            r#"{"id":"sess-v2","version":2,"cwd":"/home/user/proj","createdAt":1767225600000,"agents":{"main":{"type":"main"}}}"#,
+        );
+
+        let connector = KimiConnector::new();
+        let ctx = ScanContext::local_default(storage.clone(), None);
+        let convs = connector.scan(&ctx).unwrap();
+
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].workspace, Some(PathBuf::from("/home/user/proj")));
     }
 
     #[test]
