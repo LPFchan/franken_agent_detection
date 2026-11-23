@@ -229,6 +229,21 @@ impl AntigravityConnector {
         db.is_file().then_some(db)
     }
 
+    /// The sibling `annotations/<uuid>.pbtxt` title sidecar, when present.
+    fn sibling_annotation_path(conversation_dir: &Path) -> Option<PathBuf> {
+        let uuid = Self::conversation_uuid(conversation_dir)?;
+        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let annotation = base.join("annotations").join(format!("{uuid}.pbtxt"));
+        annotation.is_file().then_some(annotation)
+    }
+
+    /// The shared `<base>/conversation_summaries.db` summary database, when present.
+    fn sibling_summaries_db_path(conversation_dir: &Path) -> Option<PathBuf> {
+        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let db = base.join("conversation_summaries.db");
+        db.is_file().then_some(db)
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
             // Mirror the explicit-root acceptance: a default-detection
@@ -302,13 +317,22 @@ impl AntigravityConnector {
         out
     }
 
-    /// True when the conversation's transcript is newer than `since_ts`.
+    /// True when the conversation's transcript or metadata sidecars are newer
+    /// than `since_ts`.
     fn conversation_modified_since(conversation_dir: &Path, since_ts: Option<i64>) -> bool {
         if since_ts.is_none() {
             return true;
         }
+        let transcript_full = Self::transcript_full_path(conversation_dir);
         file_modified_since(&Self::transcript_path(conversation_dir), since_ts)
-            || file_modified_since(&Self::transcript_full_path(conversation_dir), since_ts)
+            || (transcript_full.is_file() && file_modified_since(&transcript_full, since_ts))
+            || Self::sibling_annotation_path(conversation_dir)
+                .is_some_and(|path| file_modified_since(&path, since_ts))
+            || Self::sibling_summaries_db_path(conversation_dir).is_some_and(|path| {
+                let wal = path.with_extension("db-wal");
+                file_modified_since(&path, since_ts)
+                    || (wal.is_file() && file_modified_since(&wal, since_ts))
+            })
     }
 
     /// Read a transcript file into per-step JSON records, tolerating blank lines
@@ -400,8 +424,23 @@ fn model_from_settings(settings: &str) -> Option<String> {
     Some(model.to_string())
 }
 
-/// The first model recorded by any `<USER_SETTINGS_CHANGE>` in the transcript.
+/// Pull the first model recorded in the transcript.
+///
+/// Newer Antigravity builds write the authoritative API model slug directly on
+/// `PLANNER_RESPONSE` records (e.g. `"gemini-4-neon-high"`). Fall back to
+/// `<USER_SETTINGS_CHANGE>` in `USER_INPUT` for older transcripts that omit
+/// per-step model fields.
 fn detect_model(records: &[Value]) -> Option<String> {
+    for rec in records {
+        if let Some(model) = rec
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(model.to_string());
+        }
+    }
     for rec in records {
         if rec.get("type").and_then(Value::as_str) != Some("USER_INPUT") {
             continue;
@@ -419,33 +458,62 @@ fn detect_model(records: &[Value]) -> Option<String> {
     None
 }
 
-/// Parse `tool_calls` into normalized invocations. When the array is absent we
-/// still synthesize one invocation named after the step `type` (e.g.
-/// `VIEW_FILE` → `view_file`) so the tool remains searchable.
-fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<NormalizedInvocation> {
-    let synthesized_name = step_type.to_ascii_lowercase();
+/// Copy per-step `model` and token usage fields from a raw transcript record
+/// into `extra`. Returns `true` when at least one token count was attached.
+fn attach_usage_and_model(rec: &Value, extra: &mut Map<String, Value>) -> bool {
+    if let Some(model) = rec
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        extra.insert("model".to_string(), Value::String(model.to_string()));
+    }
+
+    let mut usage = Map::new();
+    for key in [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ] {
+        if let Some(value) = rec.get(key).and_then(Value::as_i64).filter(|&v| v >= 0) {
+            usage.insert(key.to_string(), Value::from(value));
+        }
+    }
+
+    if usage.is_empty() {
+        false
+    } else {
+        extra.insert("usage".to_string(), Value::Object(usage));
+        true
+    }
+}
+
+/// Parse structured `tool_calls` entries without synthesizing a fallback entry.
+fn parse_explicit_tool_calls(
+    tool_calls: Option<&Value>,
+    fallback_name: Option<&str>,
+) -> Vec<NormalizedInvocation> {
     let Some(arr) = tool_calls
         .and_then(Value::as_array)
         .filter(|a| !a.is_empty())
     else {
-        return vec![NormalizedInvocation {
-            kind: "tool".to_string(),
-            name: synthesized_name,
-            raw_name: None,
-            call_id: None,
-            arguments: None,
-        }];
+        return Vec::new();
     };
 
     arr.iter()
-        .map(|tc| {
+        .filter_map(|tc| {
             let name = tc
                 .get("name")
                 .or_else(|| tc.get("tool_name"))
                 .or_else(|| tc.pointer("/function/name"))
                 .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
-                .map_or_else(|| synthesized_name.clone(), String::from);
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .or_else(|| fallback_name.map(String::from))?;
             let call_id = tc
                 .get("id")
                 .or_else(|| tc.get("call_id"))
@@ -465,15 +533,304 @@ fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<Normaliz
                     }
                     other => other,
                 });
-            NormalizedInvocation {
+            Some(NormalizedInvocation {
                 kind: "tool".to_string(),
                 name,
                 raw_name: None,
                 call_id,
                 arguments,
-            }
+            })
         })
         .collect()
+}
+
+/// Parse `tool_calls` into normalized invocations. When the array is absent we
+/// still synthesize one invocation named after the step `type` (e.g.
+/// `VIEW_FILE` → `view_file`) so the tool remains searchable.
+fn parse_tool_calls(tool_calls: Option<&Value>, step_type: &str) -> Vec<NormalizedInvocation> {
+    let synthesized_name = step_type.to_ascii_lowercase();
+    let parsed = parse_explicit_tool_calls(tool_calls, Some(&synthesized_name));
+    if parsed.is_empty() {
+        vec![NormalizedInvocation {
+            kind: "tool".to_string(),
+            name: synthesized_name,
+            raw_name: None,
+            call_id: None,
+            arguments: None,
+        }]
+    } else {
+        parsed
+    }
+}
+
+/// Detect the parent conversation UUID of a spawned Antigravity subagent from
+/// its step-0 `SYSTEM_MESSAGE` (`[Message] ... sender=<uuid> ...`).
+fn detect_parent_from_records(ordered: &[&Value]) -> Option<String> {
+    let first = ordered.first()?;
+    if first.get("type").and_then(Value::as_str) != Some("SYSTEM_MESSAGE") {
+        return None;
+    }
+    let content = first.get("content").and_then(Value::as_str)?;
+    for line in content.lines() {
+        if !line.contains("[Message]") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("sender=") {
+            let candidate = rest.split_whitespace().next().unwrap_or("").trim();
+            if !candidate.is_empty()
+                && candidate
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read the optional `title:"..."` field from `<base>/annotations/<uuid>.pbtxt`.
+fn annotation_title(base: &Path, uuid: &str) -> Option<String> {
+    let path = base.join("annotations").join(format!("{uuid}.pbtxt"));
+    let text = std::fs::read_to_string(path).ok()?;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix("title:") else {
+            continue;
+        };
+        if let Some(title) = parse_pbtxt_string(rest.trim()) {
+            let title = title.trim();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Parse a double-quoted protobuf text-format string literal, decoding octal
+/// (`\ooo`) and hex (`\xHH`) byte escapes into UTF-8.
+fn parse_pbtxt_string(input: &str) -> Option<String> {
+    const fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.strip_prefix('"')?.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return String::from_utf8(out).ok(),
+            b'\\' => {
+                i += 1;
+                let esc = *bytes.get(i)?;
+                match esc {
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'\'' => out.push(b'\''),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'0'..=b'7' => {
+                        let mut val: u16 = u16::from(esc - b'0');
+                        for _ in 0..2 {
+                            if let Some(&next) = bytes.get(i + 1)
+                                && (b'0'..=b'7').contains(&next)
+                            {
+                                val = val * 8 + u16::from(next - b'0');
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        out.push(u8::try_from(val).ok()?);
+                    }
+                    b'x' | b'X' => {
+                        let hi = hex_val(*bytes.get(i + 1)?)?;
+                        i += 1;
+                        let val = bytes
+                            .get(i + 1)
+                            .copied()
+                            .and_then(hex_val)
+                            .map_or(hi, |lo| {
+                                i += 1;
+                                (hi << 4) | lo
+                            });
+                        out.push(val);
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoding for `file://` URIs (no external dependency).
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb"
+))]
+fn percent_decode(input: &str) -> String {
+    const fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut pos = 0;
+    while pos < bytes.len() {
+        if bytes[pos] == b'%'
+            && pos + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[pos + 1]), hex_val(bytes[pos + 2]))
+        {
+            out.push((hi << 4) | lo);
+            pos += 3;
+            continue;
+        }
+        out.push(bytes[pos]);
+        pos += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Parse a `file://` workspace URI (or plain path) into a local `PathBuf`.
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb"
+))]
+fn parse_workspace_uri(uri: &str) -> Option<PathBuf> {
+    let trimmed = uri.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let Some(rest) = trimmed.strip_prefix("file://") else {
+        return Path::new(trimmed)
+            .is_absolute()
+            .then(|| PathBuf::from(trimmed));
+    };
+    let decoded = percent_decode(rest);
+    let mut path = decoded.as_str();
+    if !path.starts_with('/')
+        && !path.starts_with('\\')
+        && let Some(slash) = path.find(['/', '\\'])
+    {
+        let authority = &path[..slash];
+        let looks_like_drive = authority.len() == 2 && authority.as_bytes()[1] == b':';
+        if !looks_like_drive {
+            path = &path[slash..];
+        }
+    }
+    if cfg!(windows) && path.len() > 2 {
+        let chars: Vec<char> = path.chars().take(3).collect();
+        if chars[0] == '/' && chars[1].is_ascii_alphabetic() && chars[2] == ':' {
+            path = &path[1..];
+        }
+    }
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+#[derive(Debug, Default)]
+struct SummaryMetadata {
+    workspace: Option<PathBuf>,
+    title: Option<String>,
+    parent_conversation_id: Option<String>,
+}
+
+/// Best-effort read of `workspace_uris`, `title`, and `parent_conversation_id`
+/// from `<base>/conversation_summaries.db`.
+#[cfg(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb"
+))]
+fn summary_metadata(base: &Path, uuid: &str) -> SummaryMetadata {
+    use super::sqlite_sync::{ConnectionExt, open_with_flags};
+
+    let db_path = base.join("conversation_summaries.db");
+    if !db_path.is_file() {
+        return SummaryMetadata::default();
+    }
+    let Some(db_str) = db_path.to_str() else {
+        return SummaryMetadata::default();
+    };
+    let Ok(conn) = open_with_flags(db_str, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) else {
+        return SummaryMetadata::default();
+    };
+    let row: rusqlite::Result<(String, String, String)> = conn.query_row_map(
+        "SELECT workspace_uris, title, parent_conversation_id \
+         FROM conversation_summaries WHERE conversation_id = ?1",
+        [uuid],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    );
+    let Ok((workspace_uris, title, parent_id)) = row else {
+        return SummaryMetadata::default();
+    };
+    let workspace = serde_json::from_str::<Vec<String>>(&workspace_uris)
+        .ok()
+        .and_then(|uris| uris.into_iter().find_map(|uri| parse_workspace_uri(&uri)));
+    let title = {
+        let trimmed = title.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    let parent_conversation_id = {
+        let trimmed = parent_id.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
+    SummaryMetadata {
+        workspace,
+        title,
+        parent_conversation_id,
+    }
+}
+
+#[cfg(not(any(
+    feature = "cursor",
+    feature = "opencode",
+    feature = "goose",
+    feature = "hermes",
+    feature = "crush",
+    feature = "devin",
+    feature = "shelley",
+    feature = "openclaw-sqlite",
+    feature = "copilot-vscdb"
+)))]
+fn summary_metadata(_base: &Path, _uuid: &str) -> SummaryMetadata {
+    SummaryMetadata::default()
 }
 
 /// Build a [`NormalizedMessage`] (idx assigned later by `reindex_messages`).
@@ -533,12 +890,18 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             Some(message("user", None, created, body, extra, Vec::new()))
         }
         "PLANNER_RESPONSE" => {
-            if content.trim().is_empty() && thinking.is_none() {
-                return None;
-            }
+            let invocations = parse_explicit_tool_calls(tool_calls, None);
             let mut extra = Map::new();
             if let Some(t) = thinking {
                 extra.insert("thinking".to_string(), Value::String(t));
+            }
+            let has_usage = attach_usage_and_model(rec, &mut extra);
+            if content.trim().is_empty()
+                && !extra.contains_key("thinking")
+                && invocations.is_empty()
+                && !has_usage
+            {
+                return None;
             }
             Some(message(
                 "assistant",
@@ -546,7 +909,7 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                 created,
                 content,
                 extra,
-                Vec::new(),
+                invocations,
             ))
         }
         "CONVERSATION_HISTORY" => None,
@@ -575,13 +938,18 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
             // (VIEW_FILE, EDIT_FILE, RUN_COMMAND, …, or an unknown future kind).
             if source == "MODEL" {
                 let invocations = parse_tool_calls(tool_calls, step_type);
-                if content.trim().is_empty() && thinking.is_none() && invocations.is_empty() {
-                    return None;
-                }
                 let mut extra = Map::new();
                 extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
                 if let Some(t) = thinking {
                     extra.insert("thinking".to_string(), Value::String(t));
+                }
+                let has_usage = attach_usage_and_model(rec, &mut extra);
+                if content.trim().is_empty()
+                    && !extra.contains_key("thinking")
+                    && invocations.is_empty()
+                    && !has_usage
+                {
+                    return None;
                 }
                 let author = step_type.to_ascii_lowercase();
                 Some(message(
@@ -593,12 +961,14 @@ fn record_to_message(rec: &Value) -> Option<NormalizedMessage> {
                     invocations,
                 ))
             } else {
-                // Unknown non-MODEL kind: preserve as a system message rather than
-                // dropping it. Never crash on an unrecognized schema.
-                if content.trim().is_empty() {
+                // Unknown non-MODEL kind (including CHECKPOINT): preserve as a
+                // system message rather than dropping it. Never crash on an
+                // unrecognized schema.
+                let mut extra = Map::new();
+                let has_usage = attach_usage_and_model(rec, &mut extra);
+                if content.trim().is_empty() && !has_usage {
                     return None;
                 }
-                let mut extra = Map::new();
                 extra.insert("agy_type".to_string(), Value::String(step_type.to_string()));
                 if !source.is_empty() {
                     extra.insert("agy_source".to_string(), Value::String(source.to_string()));
@@ -629,9 +999,18 @@ fn parse_conversation(
 
     let base = AntigravityConnector::base_of_conversation_dir(conversation_dir);
     let layout = base.and_then(AntigravityLayout::from_base);
-    let external_id = AntigravityConnector::conversation_uuid(conversation_dir)
-        .map(|uuid| layout.unwrap_or(AntigravityLayout::Cli).external_id(&uuid));
+    let uuid = AntigravityConnector::conversation_uuid(conversation_dir);
+    let external_id = uuid
+        .as_deref()
+        .map(|id| layout.unwrap_or(AntigravityLayout::Cli).external_id(id));
     let model = detect_model(&records);
+    let ann_title = base.and_then(|b| uuid.as_deref().and_then(|id| annotation_title(b, id)));
+    let summary = base
+        .and_then(|b| uuid.as_deref().map(|id| summary_metadata(b, id)))
+        .unwrap_or_default();
+    let parent_conversation_id = summary
+        .parent_conversation_id
+        .or_else(|| detect_parent_from_records(&ordered));
 
     let mut messages: Vec<NormalizedMessage> = Vec::new();
     let mut started_at: Option<i64> = None;
@@ -662,17 +1041,22 @@ fn parse_conversation(
 
     reindex_messages(&mut messages);
 
-    let title = messages
-        .iter()
-        .find(|m| m.role == "user")
-        .or_else(|| messages.first())
-        .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
-        .map(|line| line.chars().take(100).collect::<String>());
+    let title = ann_title.or(summary.title).or_else(|| {
+        messages
+            .iter()
+            .find(|m| m.role == "user")
+            .or_else(|| messages.first())
+            .and_then(|m| m.content.lines().find(|l| !l.trim().is_empty()))
+            .map(|line| line.chars().take(100).collect::<String>())
+    });
 
     let mut metadata = Map::new();
     metadata.insert("source".to_string(), Value::String(AGENT_SLUG.to_string()));
     if let Some(model) = model {
         metadata.insert("model".to_string(), Value::String(model));
+    }
+    if let Some(parent) = parent_conversation_id {
+        metadata.insert("parent_conversation_id".to_string(), Value::String(parent));
     }
     // Provenance: which store (IDE vs CLI) and which base directory this
     // conversation was read from, so identical uuids across stores stay
@@ -694,7 +1078,7 @@ fn parse_conversation(
         agent_slug: AGENT_SLUG.to_string(),
         external_id,
         title,
-        workspace: None,
+        workspace: summary.workspace,
         source_path: transcript,
         started_at,
         ended_at,
@@ -789,6 +1173,56 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
                             &root,
                             db,
                             DiscoveredSourceRole::SqliteDatabase,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+            }
+
+            // Optional title sidecar (`annotations/<uuid>.pbtxt`).
+            if let Some(annotation) =
+                AntigravityConnector::sibling_annotation_path(&conversation_dir)
+                && seen.insert(dedupe_path_key(&annotation))
+            {
+                out.push(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        annotation,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+
+            // Shared summary database (`conversation_summaries.db`) and its WAL
+            // sidecar when present, deduplicated across conversations in the
+            // same base directory.
+            if let Some(summaries_db) =
+                AntigravityConnector::sibling_summaries_db_path(&conversation_dir)
+            {
+                let wal = summaries_db.with_extension("db-wal");
+                if seen.insert(dedupe_path_key(&summaries_db)) {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            summaries_db,
+                            DiscoveredSourceRole::SqliteDatabase,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if wal.is_file() && seen.insert(dedupe_path_key(&wal)) {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            wal,
+                            DiscoveredSourceRole::MetadataSidecar,
                             false,
                         )
                         .with_fs_metadata(),
@@ -1566,5 +2000,246 @@ mod tests {
             conv.metadata["data_root"],
             fixture_base().to_string_lossy().as_ref()
         );
+    }
+
+    #[test]
+    fn planner_response_keeps_usage_model_and_tool_calls_without_text() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let conv_dir = tmp.path().join("brain").join(uuid);
+        let logs = conv_dir.join(".system_generated").join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            concat!(
+                "{\"step_index\":0,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"status\":\"DONE\",\"created_at\":\"2026-11-23T14:57:40Z\",\"content\":\"<USER_REQUEST>\\ncheck status\\n</USER_REQUEST>\\n<USER_SETTINGS_CHANGE>\\nThe user changed setting `Model Selection` from None to Gemini 4 Neon (High).\\n</USER_SETTINGS_CHANGE>\"}\n",
+                "{\"step_index\":1,\"source\":\"MODEL\",\"type\":\"PLANNER_RESPONSE\",\"status\":\"DONE\",\"created_at\":\"2026-11-23T14:57:41Z\",\"model\":\"gemini-4-neon-high\",\"input_tokens\":2517,\"cache_read_tokens\":12725,\"output_tokens\":717,\"tool_calls\":[{\"name\":\"read_file\",\"args\":{\"Path\":\"/tmp/a.rs\"}}]}\n",
+                "{\"step_index\":2,\"source\":\"SYSTEM\",\"type\":\"CHECKPOINT\",\"status\":\"DONE\",\"created_at\":\"2026-11-23T14:58:00Z\",\"input_tokens\":6982,\"cache_read_tokens\":508361,\"output_tokens\":5673,\"content\":\"compacted\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        let conv = &convs[0];
+        assert_eq!(conv.metadata["model"], "gemini-4-neon-high");
+        assert_eq!(conv.messages.len(), 3);
+
+        let planner = &conv.messages[1];
+        assert_eq!(planner.role, "assistant");
+        assert_eq!(planner.extra["model"], "gemini-4-neon-high");
+        assert_eq!(planner.extra["usage"]["input_tokens"], 2517);
+        assert_eq!(planner.extra["usage"]["cache_read_tokens"], 12725);
+        assert_eq!(planner.extra["usage"]["output_tokens"], 717);
+        assert_eq!(planner.invocations.len(), 1);
+        assert_eq!(planner.invocations[0].name, "read_file");
+
+        let checkpoint = &conv.messages[2];
+        assert_eq!(checkpoint.role, "system");
+        assert_eq!(checkpoint.extra["agy_type"], "CHECKPOINT");
+        assert_eq!(checkpoint.extra["usage"]["input_tokens"], 6982);
+        assert_eq!(checkpoint.extra["usage"]["cache_read_tokens"], 508_361);
+        assert_eq!(checkpoint.extra["usage"]["output_tokens"], 5673);
+    }
+
+    #[test]
+    fn annotation_pbtxt_sets_title_and_system_message_sets_parent() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "22222222-3333-4444-8555-666666666666";
+        let parent_uuid = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        let conv_dir = tmp.path().join("brain").join(uuid);
+        let logs = conv_dir.join(".system_generated").join("logs");
+        let annotations = tmp.path().join("annotations");
+        fs::create_dir_all(&logs).unwrap();
+        fs::create_dir_all(&annotations).unwrap();
+        fs::write(
+            annotations.join(format!("{uuid}.pbtxt")),
+            "title:\"Fix \\\"Quoted\\\" Title\"\n",
+        )
+        .unwrap();
+        fs::write(
+            logs.join("transcript.jsonl"),
+            format!(
+                "{{\"step_index\":0,\"source\":\"SYSTEM\",\"type\":\"SYSTEM_MESSAGE\",\"status\":\"DONE\",\"created_at\":\"2026-11-23T11:40:54Z\",\"content\":\"The following is a <SYSTEM_MESSAGE>\\n\\n<SYSTEM_MESSAGE>\\n[Message] timestamp=2026-11-23T11:40:54Z sender={parent_uuid} priority=MESSAGE_PRIORITY_HIGH content=Do work\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Fix \"Quoted\" Title"));
+        assert_eq!(
+            convs[0].metadata["parent_conversation_id"].as_str(),
+            Some(parent_uuid)
+        );
+    }
+
+    #[cfg(any(
+        feature = "cursor",
+        feature = "opencode",
+        feature = "goose",
+        feature = "hermes",
+        feature = "crush",
+        feature = "devin",
+        feature = "shelley",
+        feature = "openclaw-sqlite",
+        feature = "copilot-vscdb"
+    ))]
+    #[test]
+    fn conversation_summaries_db_provides_workspace_title_and_parent() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "33333333-4444-4555-8666-777777777777";
+        let parent_uuid = "99999999-8888-4777-8666-555555555555";
+        write_conversation(tmp.path(), uuid, "hello");
+
+        let db_path = tmp.path().join("conversation_summaries.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                workspace_uris TEXT NOT NULL,
+                parent_conversation_id TEXT NOT NULL DEFAULT ''
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries (conversation_id, title, workspace_uris, parent_conversation_id) VALUES (?1, ?2, ?3, ?4)",
+            (
+                uuid,
+                "Heatmap Investigation",
+                "[\"file:///home/yeowool/my%20heatmap\"]",
+                parent_uuid,
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(
+            convs[0].workspace.as_deref(),
+            Some(Path::new("/home/yeowool/my heatmap"))
+        );
+        assert_eq!(convs[0].title.as_deref(), Some("Heatmap Investigation"));
+        assert_eq!(
+            convs[0].metadata["parent_conversation_id"].as_str(),
+            Some(parent_uuid)
+        );
+    }
+
+    #[test]
+    fn discovery_includes_annotations_and_deduplicates_summaries_db() {
+        let tmp = TempDir::new().unwrap();
+        let uuid_a = "44444444-1111-4222-8333-555555555555";
+        let uuid_b = "55555555-1111-4222-8333-666666666666";
+        write_conversation(tmp.path(), uuid_a, "first");
+        write_conversation(tmp.path(), uuid_b, "second");
+
+        let annotations = tmp.path().join("annotations");
+        fs::create_dir_all(&annotations).unwrap();
+        let ann_a = annotations.join(format!("{uuid_a}.pbtxt"));
+        fs::write(&ann_a, "title:\"First\"\n").unwrap();
+        let summaries_db = tmp.path().join("conversation_summaries.db");
+        fs::write(&summaries_db, b"").unwrap();
+        let summaries_wal = tmp.path().join("conversation_summaries.db-wal");
+        fs::write(&summaries_wal, b"").unwrap();
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let discovered = AntigravityConnector::new()
+            .discover_source_files(&ctx)
+            .unwrap();
+        assert!(discovered.iter().any(|d| {
+            d.source_path == ann_a
+                && d.role == DiscoveredSourceRole::MetadataSidecar
+                && !d.required_for_reconstruction
+        }));
+        let summary_hits: Vec<_> = discovered
+            .iter()
+            .filter(|d| d.source_path == summaries_db)
+            .collect();
+        assert_eq!(summary_hits.len(), 1);
+        assert_eq!(summary_hits[0].role, DiscoveredSourceRole::SqliteDatabase);
+        assert!(!summary_hits[0].required_for_reconstruction);
+        let wal_hits: Vec<_> = discovered
+            .iter()
+            .filter(|d| d.source_path == summaries_wal)
+            .collect();
+        assert_eq!(wal_hits.len(), 1);
+        assert_eq!(wal_hits[0].role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(!wal_hits[0].required_for_reconstruction);
+    }
+
+    #[test]
+    fn parse_pbtxt_string_decodes_octal_and_hex_utf8_and_rejects_unknown() {
+        assert_eq!(
+            parse_pbtxt_string(r#""caf\303\251""#).as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            parse_pbtxt_string(r#""caf\xc3\xa9""#).as_deref(),
+            Some("café")
+        );
+        assert_eq!(parse_pbtxt_string(r#""bad\qescape""#), None);
+        assert_eq!(parse_pbtxt_string(r#""bad\777""#), None);
+    }
+
+    #[test]
+    fn modified_annotation_triggers_incremental_scan() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "66666666-1111-4222-8333-777777777777";
+        let conv_dir = write_conversation(tmp.path(), uuid, "old prompt");
+        let transcript = AntigravityConnector::transcript_path(&conv_dir);
+        let transcript_mtime = fs::metadata(&transcript)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let since_ts = i64::try_from(transcript_mtime).unwrap() + 5_000;
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            Some(since_ts),
+        );
+        assert!(AntigravityConnector::new().scan(&ctx).unwrap().is_empty());
+
+        let annotations = tmp.path().join("annotations");
+        fs::create_dir_all(&annotations).unwrap();
+        let ann_path = annotations.join(format!("{uuid}.pbtxt"));
+        fs::write(&ann_path, "title:\"Renamed\"\n").unwrap();
+        let future = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(u64::try_from(since_ts + 5_000).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&ann_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Renamed"));
     }
 }

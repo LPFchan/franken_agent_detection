@@ -348,6 +348,52 @@ pub fn extract_miniharness_tokens(extra: &Value) -> ExtractedTokenUsage {
     }
 }
 
+/// Extract token usage from an Antigravity message's raw or normalized `extra` data.
+#[must_use]
+pub fn extract_antigravity_tokens(extra: &Value) -> ExtractedTokenUsage {
+    let model_name = extra
+        .get("model")
+        .or_else(|| extra.pointer("/cass/model"))
+        .and_then(Value::as_str)
+        .map(String::from);
+    let provider = model_name
+        .as_deref()
+        .map(|name| normalize_model(name).provider);
+    let usage = extra.get("usage").unwrap_or(extra);
+    let input_tokens = usage.get("input_tokens").and_then(Value::as_i64);
+    let output_tokens = usage.get("output_tokens").and_then(Value::as_i64);
+    let cache_read_tokens = usage.get("cache_read_tokens").and_then(Value::as_i64);
+    let cache_creation_tokens = usage
+        .get("cache_write_tokens")
+        .or_else(|| usage.get("cache_creation_tokens"))
+        .and_then(Value::as_i64);
+    let thinking_tokens = usage
+        .get("reasoning_tokens")
+        .or_else(|| usage.get("thinking_tokens"))
+        .and_then(Value::as_i64);
+    let has_api_data = input_tokens.is_some()
+        || output_tokens.is_some()
+        || cache_read_tokens.is_some()
+        || cache_creation_tokens.is_some()
+        || thinking_tokens.is_some();
+
+    ExtractedTokenUsage {
+        model_name,
+        provider,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_tokens,
+        thinking_tokens,
+        data_source: if has_api_data {
+            TokenDataSource::Api
+        } else {
+            TokenDataSource::Estimated
+        },
+        ..Default::default()
+    }
+}
+
 /// Estimate tokens from content length for agents that do not provide token data.
 #[must_use]
 pub fn estimate_tokens_from_content(content: &str, role: &str) -> ExtractedTokenUsage {
@@ -381,6 +427,7 @@ pub fn extract_tokens_for_agent(
         "claude_code" => extract_claude_code_tokens(extra),
         "codex" => extract_codex_tokens(extra),
         "miniharness" => extract_miniharness_tokens(extra),
+        "antigravity" => extract_antigravity_tokens(extra),
         // Prime Agent assistant messages carry a full usage block
         // (`input`/`output`/`cacheRead`/`cacheWrite`), which the connector
         // preserves under `extra.usage`. Child-usage attribution entries are
@@ -485,7 +532,7 @@ pub fn extract_tokens_for_agent(
                 }
             }
         }
-        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" | "antigravity" => {
+        "cursor" | "pi_agent" | "factory" | "opencode" | "gemini" => {
             let model_name = extra
                 .get("model")
                 .or_else(|| extra.pointer("/cass/model"))
@@ -800,6 +847,41 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, Some(30));
         assert_eq!(usage.cache_creation_tokens, Some(4));
         assert_eq!(usage.thinking_tokens, Some(5));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_from_normalized_extra() {
+        let extra: Value = serde_json::json!({
+            "model": "gemini-4-neon-high",
+            "usage": {
+                "input_tokens": 2517,
+                "cache_read_tokens": 12725,
+                "output_tokens": 717
+            }
+        });
+        let usage = extract_tokens_for_agent("antigravity", &extra, "", "assistant");
+        assert_eq!(usage.model_name.as_deref(), Some("gemini-4-neon-high"));
+        assert_eq!(usage.provider.as_deref(), Some("google"));
+        assert_eq!(usage.input_tokens, Some(2517));
+        assert_eq!(usage.cache_read_tokens, Some(12725));
+        assert_eq!(usage.output_tokens, Some(717));
+        assert_eq!(usage.data_source, TokenDataSource::Api);
+    }
+
+    #[test]
+    fn extract_antigravity_tokens_from_raw_checkpoint_record() {
+        let raw: Value = serde_json::json!({
+            "type": "CHECKPOINT",
+            "input_tokens": 6982,
+            "cache_read_tokens": 508_361,
+            "output_tokens": 5673
+        });
+        let usage = extract_antigravity_tokens(&raw);
+        assert_eq!(usage.model_name, None);
+        assert_eq!(usage.input_tokens, Some(6982));
+        assert_eq!(usage.cache_read_tokens, Some(508_361));
+        assert_eq!(usage.output_tokens, Some(5673));
         assert_eq!(usage.data_source, TokenDataSource::Api);
     }
 }
