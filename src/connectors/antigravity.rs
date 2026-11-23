@@ -229,6 +229,21 @@ impl AntigravityConnector {
         db.is_file().then_some(db)
     }
 
+    /// The sibling `annotations/<uuid>.pbtxt` title sidecar, when present.
+    fn sibling_annotation_path(conversation_dir: &Path) -> Option<PathBuf> {
+        let uuid = Self::conversation_uuid(conversation_dir)?;
+        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let annotation = base.join("annotations").join(format!("{uuid}.pbtxt"));
+        annotation.is_file().then_some(annotation)
+    }
+
+    /// The shared `<base>/conversation_summaries.db` summary database, when present.
+    fn sibling_summaries_db_path(conversation_dir: &Path) -> Option<PathBuf> {
+        let base = Self::base_of_conversation_dir(conversation_dir)?;
+        let db = base.join("conversation_summaries.db");
+        db.is_file().then_some(db)
+    }
+
     fn source_roots(ctx: &ScanContext) -> Vec<ScanRoot> {
         let mut roots = if ctx.use_default_detection() {
             // Mirror the explicit-root acceptance: a default-detection
@@ -1108,6 +1123,41 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
                         .with_fs_metadata(),
                     );
                 }
+            }
+
+            // Optional title sidecar (`annotations/<uuid>.pbtxt`).
+            if let Some(annotation) =
+                AntigravityConnector::sibling_annotation_path(&conversation_dir)
+                && seen.insert(dedupe_path_key(&annotation))
+            {
+                out.push(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        annotation,
+                        DiscoveredSourceRole::MetadataSidecar,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                );
+            }
+
+            // Shared summary database (`conversation_summaries.db`), deduplicated
+            // across conversations in the same base directory.
+            if let Some(summaries_db) =
+                AntigravityConnector::sibling_summaries_db_path(&conversation_dir)
+                && seen.insert(dedupe_path_key(&summaries_db))
+            {
+                out.push(
+                    DiscoveredSourceFile::new(
+                        AGENT_SLUG,
+                        &root,
+                        summaries_db,
+                        DiscoveredSourceRole::SqliteDatabase,
+                        false,
+                    )
+                    .with_fs_metadata(),
+                );
             }
         }
     }
@@ -2021,5 +2071,42 @@ mod tests {
             convs[0].metadata["parent_conversation_id"].as_str(),
             Some(parent_uuid)
         );
+    }
+
+    #[test]
+    fn discovery_includes_annotations_and_deduplicates_summaries_db() {
+        let tmp = TempDir::new().unwrap();
+        let uuid_a = "44444444-1111-4222-8333-555555555555";
+        let uuid_b = "55555555-1111-4222-8333-666666666666";
+        write_conversation(tmp.path(), uuid_a, "first");
+        write_conversation(tmp.path(), uuid_b, "second");
+
+        let annotations = tmp.path().join("annotations");
+        fs::create_dir_all(&annotations).unwrap();
+        let ann_a = annotations.join(format!("{uuid_a}.pbtxt"));
+        fs::write(&ann_a, "title:\"First\"\n").unwrap();
+        let summaries_db = tmp.path().join("conversation_summaries.db");
+        fs::write(&summaries_db, b"").unwrap();
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            None,
+        );
+        let discovered = AntigravityConnector::new()
+            .discover_source_files(&ctx)
+            .unwrap();
+        assert!(discovered.iter().any(|d| {
+            d.source_path == ann_a
+                && d.role == DiscoveredSourceRole::MetadataSidecar
+                && !d.required_for_reconstruction
+        }));
+        let summary_hits: Vec<_> = discovered
+            .iter()
+            .filter(|d| d.source_path == summaries_db)
+            .collect();
+        assert_eq!(summary_hits.len(), 1);
+        assert_eq!(summary_hits[0].role, DiscoveredSourceRole::SqliteDatabase);
+        assert!(!summary_hits[0].required_for_reconstruction);
     }
 }
