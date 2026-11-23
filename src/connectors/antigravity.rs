@@ -317,13 +317,22 @@ impl AntigravityConnector {
         out
     }
 
-    /// True when the conversation's transcript is newer than `since_ts`.
+    /// True when the conversation's transcript or metadata sidecars are newer
+    /// than `since_ts`.
     fn conversation_modified_since(conversation_dir: &Path, since_ts: Option<i64>) -> bool {
         if since_ts.is_none() {
             return true;
         }
+        let transcript_full = Self::transcript_full_path(conversation_dir);
         file_modified_since(&Self::transcript_path(conversation_dir), since_ts)
-            || file_modified_since(&Self::transcript_full_path(conversation_dir), since_ts)
+            || (transcript_full.is_file() && file_modified_since(&transcript_full, since_ts))
+            || Self::sibling_annotation_path(conversation_dir)
+                .is_some_and(|path| file_modified_since(&path, since_ts))
+            || Self::sibling_summaries_db_path(conversation_dir).is_some_and(|path| {
+                let wal = path.with_extension("db-wal");
+                file_modified_since(&path, since_ts)
+                    || (wal.is_file() && file_modified_since(&wal, since_ts))
+            })
     }
 
     /// Read a transcript file into per-step JSON records, tolerating blank lines
@@ -599,23 +608,69 @@ fn annotation_title(base: &Path, uuid: &str) -> Option<String> {
     None
 }
 
-/// Parse a double-quoted protobuf text-format string literal.
+/// Parse a double-quoted protobuf text-format string literal, decoding octal
+/// (`\ooo`) and hex (`\xHH`) byte escapes into UTF-8.
 fn parse_pbtxt_string(input: &str) -> Option<String> {
-    let inner = input.strip_prefix('"')?;
-    let mut out = String::with_capacity(inner.len());
-    let mut chars = inner.chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => return Some(out),
-            '\\' => match chars.next()? {
-                '\\' => out.push('\\'),
-                '"' => out.push('"'),
-                'n' => out.push('\n'),
-                'r' => out.push('\r'),
-                't' => out.push('\t'),
-                other => out.push(other),
-            },
-            other => out.push(other),
+    const fn hex_val(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+
+    let bytes = input.strip_prefix('"')?.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return String::from_utf8(out).ok(),
+            b'\\' => {
+                i += 1;
+                let esc = *bytes.get(i)?;
+                match esc {
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'\'' => out.push(b'\''),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'0'..=b'7' => {
+                        let mut val: u16 = u16::from(esc - b'0');
+                        for _ in 0..2 {
+                            if let Some(&next) = bytes.get(i + 1)
+                                && (b'0'..=b'7').contains(&next)
+                            {
+                                val = val * 8 + u16::from(next - b'0');
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        out.push(u8::try_from(val).ok()?);
+                    }
+                    b'x' | b'X' => {
+                        let hi = hex_val(*bytes.get(i + 1)?)?;
+                        i += 1;
+                        let val = bytes
+                            .get(i + 1)
+                            .copied()
+                            .and_then(hex_val)
+                            .map_or(hi, |lo| {
+                                i += 1;
+                                (hi << 4) | lo
+                            });
+                        out.push(val);
+                    }
+                    _ => return None,
+                }
+                i += 1;
+            }
+            byte => {
+                out.push(byte);
+                i += 1;
+            }
         }
     }
     None
@@ -2108,5 +2163,59 @@ mod tests {
         assert_eq!(summary_hits.len(), 1);
         assert_eq!(summary_hits[0].role, DiscoveredSourceRole::SqliteDatabase);
         assert!(!summary_hits[0].required_for_reconstruction);
+    }
+
+    #[test]
+    fn parse_pbtxt_string_decodes_octal_and_hex_utf8_and_rejects_unknown() {
+        assert_eq!(
+            parse_pbtxt_string(r#""caf\303\251""#).as_deref(),
+            Some("café")
+        );
+        assert_eq!(
+            parse_pbtxt_string(r#""caf\xc3\xa9""#).as_deref(),
+            Some("café")
+        );
+        assert_eq!(parse_pbtxt_string(r#""bad\qescape""#), None);
+        assert_eq!(parse_pbtxt_string(r#""bad\777""#), None);
+    }
+
+    #[test]
+    fn modified_annotation_triggers_incremental_scan() {
+        let tmp = TempDir::new().unwrap();
+        let uuid = "66666666-1111-4222-8333-777777777777";
+        let conv_dir = write_conversation(tmp.path(), uuid, "old prompt");
+        let transcript = AntigravityConnector::transcript_path(&conv_dir);
+        let transcript_mtime = fs::metadata(&transcript)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let since_ts = i64::try_from(transcript_mtime).unwrap() + 5_000;
+
+        let ctx = ScanContext::with_roots(
+            tmp.path().to_path_buf(),
+            vec![ScanRoot::local(tmp.path().to_path_buf())],
+            Some(since_ts),
+        );
+        assert!(AntigravityConnector::new().scan(&ctx).unwrap().is_empty());
+
+        let annotations = tmp.path().join("annotations");
+        fs::create_dir_all(&annotations).unwrap();
+        let ann_path = annotations.join(format!("{uuid}.pbtxt"));
+        fs::write(&ann_path, "title:\"Renamed\"\n").unwrap();
+        let future = std::time::UNIX_EPOCH
+            + std::time::Duration::from_millis(u64::try_from(since_ts + 5_000).unwrap());
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&ann_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        let convs = AntigravityConnector::new().scan(&ctx).unwrap();
+        assert_eq!(convs.len(), 1);
+        assert_eq!(convs[0].title.as_deref(), Some("Renamed"));
     }
 }
