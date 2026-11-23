@@ -1197,22 +1197,37 @@ fn discover_sources(ctx: &ScanContext) -> Vec<DiscoveredSourceFile> {
                 );
             }
 
-            // Shared summary database (`conversation_summaries.db`), deduplicated
-            // across conversations in the same base directory.
+            // Shared summary database (`conversation_summaries.db`) and its WAL
+            // sidecar when present, deduplicated across conversations in the
+            // same base directory.
             if let Some(summaries_db) =
                 AntigravityConnector::sibling_summaries_db_path(&conversation_dir)
-                && seen.insert(dedupe_path_key(&summaries_db))
             {
-                out.push(
-                    DiscoveredSourceFile::new(
-                        AGENT_SLUG,
-                        &root,
-                        summaries_db,
-                        DiscoveredSourceRole::SqliteDatabase,
-                        false,
-                    )
-                    .with_fs_metadata(),
-                );
+                let wal = summaries_db.with_extension("db-wal");
+                if seen.insert(dedupe_path_key(&summaries_db)) {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            summaries_db,
+                            DiscoveredSourceRole::SqliteDatabase,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
+                if wal.is_file() && seen.insert(dedupe_path_key(&wal)) {
+                    out.push(
+                        DiscoveredSourceFile::new(
+                            AGENT_SLUG,
+                            &root,
+                            wal,
+                            DiscoveredSourceRole::MetadataSidecar,
+                            false,
+                        )
+                        .with_fs_metadata(),
+                    );
+                }
             }
         }
     }
@@ -2142,6 +2157,8 @@ mod tests {
         fs::write(&ann_a, "title:\"First\"\n").unwrap();
         let summaries_db = tmp.path().join("conversation_summaries.db");
         fs::write(&summaries_db, b"").unwrap();
+        let summaries_wal = tmp.path().join("conversation_summaries.db-wal");
+        fs::write(&summaries_wal, b"").unwrap();
 
         let ctx = ScanContext::with_roots(
             tmp.path().to_path_buf(),
@@ -2163,6 +2180,13 @@ mod tests {
         assert_eq!(summary_hits.len(), 1);
         assert_eq!(summary_hits[0].role, DiscoveredSourceRole::SqliteDatabase);
         assert!(!summary_hits[0].required_for_reconstruction);
+        let wal_hits: Vec<_> = discovered
+            .iter()
+            .filter(|d| d.source_path == summaries_wal)
+            .collect();
+        assert_eq!(wal_hits.len(), 1);
+        assert_eq!(wal_hits[0].role, DiscoveredSourceRole::MetadataSidecar);
+        assert!(!wal_hits[0].required_for_reconstruction);
     }
 
     #[test]
